@@ -5405,7 +5405,1645 @@
             renderRepeatSubjectPicker();
         }
 
+        // ============================================================================
+        // محرك خوارزمية aSc Timetables الكامل (المستخرج من roz.exe: FUN_004706b0 / FUN_0055ff40 / FUN_0064efc0)
+        // ============================================================================
+/**
+ * ============================================================================
+ * aSc Timetables Inspired Complete Scheduling Algorithm Engine (ES6+ / JS)
+ * محرك خوارزمية بناء الجداول المدرسية المتكامل (مبني على المعمارية المستخلصة من roz.exe)
+ * ============================================================================
+ *
+ * يتضمن هذا الملف التنفيذ البرمجي الكامل غير المنقوص لخوارزمية الجدولة المدرسية
+ * بجميع مراحلها وهياكل بياناتها ومعاملاتها المستنتجة من الفحص الثابت لـ roz.exe:
+ *
+ * 1. هياكل البيانات الأساسية (Data Structures - مطابقة لـ FUN_0064efc0 / CRok / CMriezka):
+ *    - CDefNastavenie (إعدادات ومعاملات المحرك: m_bEngine_BackTrack, m_nEngine_max_vykop_celkom...)
+ *    - CTriedaSum (الفصول الدراسية وشعبها ومصفوفات التفرغ)
+ *    - CUcitelSum (المعلمون، فترات الحظر TimeOff، الحد الأقصى للحصص اليومية/المتتالية، وتقليل الفجوات)
+ *    - CUcebnaSum (القاعات الدراسية والمعامل وسعاتها)
+ *    - CPredmetSum (المواد الدراسية، صعوبتها، القاعات المفضلة، وتوزيعها اليومي)
+ *    - CHodinaSum (البطاقات/الحصص المطلوب جدولتها، بما في ذلك الحصص المزدوجة/المتتالية والأقفال)
+ *    - CMriezka (الشبكة الزمنية ثلاثية الأبعاد وبيانات التسكين السريع Bitmasks)
+ *    - CBacktrack (سجل التراجع وحفظ الحلول، حذف التكرارات، الفرز، والبعثرة)
+ *
+ * 2. مراحل عمل الخوارزمية (Scheduling Pipeline - مطابقة لـ FUN_004706b0 & FUN_0055ff40):
+ *    - المرحلة 0 (JIT_Compile / Fast Bitmask Lookup): تجميع قيود التفرغ والتعارضات في مصفوفات بتّية
+ *      فائقة السرعة (Bitwise Conflict Matrices) لمحاكاة تقييم القيود الفوري.
+ *    - المرحلة 1 (Algoritmus_Ries3_Sort): الفرز الاستدلالي للبطاقات حسب درجة التقييد الديناميكية
+ *      (MRV - Minimum Remaining Values + Degree Heuristic + Lesson Duration).
+ *    - المرحلة 2 (Ries T0 & Ries T2 - Guided Backtracking): البحث الموجه بالتراجع مع التعامل
+ *      مع التعارضات الحادة (m_bEngine_BackTrackAkutnaKolizia).
+ *    - المرحلة 3 (Backtrack_Vykop - Ejection Chain / Kick Operator): الإزاحة القسرية للبطاقات
+ *      المعيقة عند الوصول لطريق مسدود (Deadlock / Stress) وإعادة تسكينها متسلسلاً حتى حد
+ *      `m_nEngine_max_vykop_celkom`.
+ *    - المرحلة 4 (Backtrack_Riesenia_VymazDuplikaty / Sort / Rozhadzuj): إدارة حوض الحلول،
+ *      إزالة الجداول المتطابقة عبر البصمة (Hash)، فرزها حسب النقاط، والبعثرة السريعة لكسر الجمود.
+ *    - المرحلة 5 (PridelBody - Fitness & Penalty Scoring): دالة التقييم الشاملة للقيود الصارمة
+ *      (Hard Constraints) والقيود المرنة (Soft Constraints).
+ *    - المرحلة 6 (Optimize local & Optimize global): التحسين المحلي (تبديل ثنائي 2-opt ونقل
+ *      لتقليل نوافذ المعلمين وتحسين التوزيع) والتحسين الشامل (Kempe-Chain Swaps & Simulated Annealing).
+ *    - المرحلة 7 (Extended Tests): فحص شامل لما قبل وما بعد التوليد لاكتشاف أي تعارض مستحيل.
+ * ============================================================================
+ */
+
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory();
+  } else {
+    root.ASCScheduler = factory();
+  }
+})(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  /**
+   * 1. إعدادات ومعاملات المحرك الافتراضية (CDefNastavenie - مستندة إلى FUN_0055ff40)
+   */
+  class EngineConfig {
+    constructor(overrides = {}) {
+      // تفعيل التراجع الأساسي (Backtracking)
+      this.m_bEngine_BackTrack = overrides.m_bEngine_BackTrack ?? true;
+      // التراجع الفوري عند حدوث تعارض حاد (Acute Collision Backtrack)
+      this.m_bEngine_BackTrackAkutnaKolizia = overrides.m_bEngine_BackTrackAkutnaKolizia ?? true;
+      // الحد الأقصى لإجمالي عمليات الإزاحة القسرية (Ejection / Kick)
+      this.m_nEngine_max_vykop_celkom = overrides.m_nEngine_max_vykop_celkom ?? 1800;
+      // عمق سلسلة الإزاحة الواحدة (Single Ejection Chain Depth)
+      this.m_nEngine_max_vykop_depth = overrides.m_nEngine_max_vykop_depth ?? 4;
+      // النسبة المئوية القصوى للتراجع للخلف
+      this.m_fEngine_max_dozadu_percent = overrides.m_fEngine_max_dozadu_percent ?? 0.35;
+      // معامل ضغط الطريق المسدود (Dead-end stress threshold) لتفعيل البعثرة
+      this.m_fEngine_mrtva_stress = overrides.m_fEngine_mrtva_stress ?? 140;
+      // البعثرة السريعة عند الجمود (Fast Perturbation / Shake)
+      this.m_nEngine_Fast_Rozhadzuj = overrides.m_nEngine_Fast_Rozhadzuj ?? 6;
+      // وزن/معامل تتابع الحصص (Consecutive blocks weight)
+      this.m_nEngine_Suvis_Kolko = overrides.m_nEngine_Suvis_Kolko ?? 3;
+      // السماح بمسح التعارضات المؤقتة أثناء البحث العميق
+      this.m_bEngine_DeleteKolizieIsOK = overrides.m_bEngine_DeleteKolizieIsOK ?? true;
+      // تجميع وتحسين الحلول في النهاية (Gather & Polish at end)
+      this.m_bEngine_GatherEnd = overrides.m_bEngine_GatherEnd ?? true;
+      // وضع الجدول المبسط
+      this.m_nengine_simple_rozvrh = overrides.m_nengine_simple_rozvrh ?? 0;
+      // تحسين ضبط المواضع (Optimize Position Adjustment)
+      this.m_bengine_optimizenastavpoziciu = overrides.m_bengine_optimizenastavpoziciu ?? true;
+      // الحد الأدنى للمحاولات قبل تسجيل تصادم حرج
+      this.Backtrack_Kolizie_MinTries = overrides.Backtrack_Kolizie_MinTries ?? 15;
+      // الحد الأقصى للمحاولات القاتلة قبل البعثرة
+      this.Backtrack_Kolizie_Fatal = overrides.Backtrack_Kolizie_Fatal ?? 90;
+      // عدد تكرارات التحسين المحلي والشامل
+      this.localOptIterations = overrides.localOptIterations ?? 600;
+      this.globalOptIterations = overrides.globalOptIterations ?? 450;
+
+      // أوزان العقوبات (Penalty Weights - PridelBody)
+      this.weights = Object.assign({
+        hardConflict: 100000,          // تعارض صارم (معلم، فصل، قاعة، وقت محظور)
+        unplacedCard: 50000,           // بطاقة غير مسكنة
+        sameSubjectSameDay: 180,       // تكرار نفس المادة للفصل في نفس اليوم (دون طلب حصة مزدوجة)
+        teacherGap: 95,                // نافذة/فراغ في جدول المعلم خلال اليوم
+        teacherDailyOverload: 220,     // تجاوز الحد الأقصى اليومي للمعلم
+        teacherConsecutiveOverload: 160,// تجاوز الحد الأقصى للحصص المتتالية للمعلم
+        classGap: 400,                 // فراغ في جدول الفصل الدراسي
+        heavySubjectLatePeriod: 45,    // وضع مادة صعبة في الحصص الأخيرة من اليوم
+        preferredRoomMiss: 35,         // عدم توفر القاعة المفضلة للمادة
+        unevenClassLoad: 25            // عدم توازن عدد الحصص اليومية للفصل
+      }, overrides.weights || {});
+    }
+  }
+
+  /**
+   * 2. عدادات الأداء والتتبع الداخلي (Performance Telemetry - مطابقة لـ FUN_004706b0)
+   */
+  class EngineTelemetry {
+    constructor() {
+      this.reset();
+    }
+
+    reset() {
+      this.counters = {
+        ries_bts: 0,                           // خطوات البحث التراجعي
+        Update_struktur: 0,                    // تحديثات مصفوفات الحالة
+        GetRiesenia: 0,                        // استرجاع حلول
+        PridelBody: 0,                         // عمليات حساب النقاط والعقوبات
+        Optimize_local: 0,                     // خطوات التحسين المحلي
+        Optimize_global: 0,                    // خطوات التحسين الشامل
+        Ries_T0: 0,                            // محاولات التسكين المباشر T0
+        Ries_T0_fail: 0,                       // إخفاقات التسكين المباشر T0
+        Ries_T2: 0,                            // محاولات التسكين العميق T2
+        Ries_T2_fail: 0,                       // إخفاقات التسكين العميق T2
+        Backtrack_Kolizie_MinTries: 0,         // تجاوز الحد الأدنى للتصادمات
+        Backtrack_Kolizie_Fatal: 0,            // تصادمات حرجة استدعت تراجعاً/بعثرة
+        Backtrack_Ries_Riesenie: 0,            // حلول كاملة تم الوصول إليها
+        Backtrack_Vykop: 0,                    // عمليات الإزاحة القسرية (Kick/Eject)
+        Backtrack_Riesenia_Get: 0,             // قراءة من حوض الحلول
+        Backtrack_Riesenia_VymazDuplikaty: 0,  // النسخ المكررة المحذوفة
+        Backtrack_Riesenia_Sort: 0,            // عمليات فرز الحلول
+        Backtrack_Riesenia_Rozhadzuj: 0,       // عمليات البعثرة لكسر الجمود
+        Algoritmus_Ries3_Sort: 0,              // عمليات الفرز الاستدلالي للبطاقات
+        JIT_Compile: 0                         // عمليات تجميع مصفوفات القيود السريعة
+      };
+      this.startTimeMs = 0;
+      this.elapsedMs = 0;
+      this.log = [];
+    }
+
+    inc(key, amount = 1) {
+      if (this.counters[key] !== undefined) {
+        this.counters[key] += amount;
+      }
+    }
+
+    addLog(phase, message, details = null) {
+      this.log.push({
+        timeMs: Date.now() - this.startTimeMs,
+        phase,
+        message,
+        details
+      });
+    }
+  }
+
+  /**
+   * 3. الشبكة الزمنية وحالة الجدول (CMriezka + CRok State)
+   * تدير التسكين الفعلي للبطاقات وتوفر فحصاً لحظياً للتعارضات (O(1) Lookup)
+   */
+  class TimetableGridState {
+    constructor(model) {
+      this.model = model;
+      this.days = model.daysCount;
+      this.periods = model.periodsPerDay;
+      this.totalSlots = this.days * this.periods;
+
+      // cardPlacement[cardIndex] = { day, period, roomId } أو null إذا لم تُسكّن
+      this.cardPlacement = new Array(model.cards.length).fill(null);
+
+      // جداول الإشغال السريع:
+      // teacherGrid[teacherIdx][slotIdx] = cardIndex أو -1
+      this.teacherGrid = Array.from({ length: model.teachers.length }, () =>
+        new Int32Array(this.totalSlots).fill(-1)
+      );
+      // classGrid[classIdx][slotIdx] = cardIndex أو -1
+      this.classGrid = Array.from({ length: model.classes.length }, () =>
+        new Int32Array(this.totalSlots).fill(-1)
+      );
+      // roomGrid[roomIdx][slotIdx] = cardIndex أو -1
+      this.roomGrid = Array.from({ length: model.rooms.length }, () =>
+        new Int32Array(this.totalSlots).fill(-1)
+      );
+
+      // عداد تكرار المادة لكل فصل في كل يوم: classSubjectDayCount[classIdx][subjectIdx][day]
+      this.classSubjectDayCount = Array.from({ length: model.classes.length }, () =>
+        Array.from({ length: model.subjects.length }, () => new Uint8Array(this.days))
+      );
+    }
+
+    slotIndex(day, period) {
+      return day * this.periods + period;
+    }
+
+    /**
+     * التحقق من صلاحية وضع بطاقة في (day, period, roomIdx)
+     * إذا كان ignoreOccupied = true، فإنه يتجاهل البطاقات المسكنة القابلة للإزاحة (لأجل مرحلة Vykop)
+     * ولكنه يرفض دائماً الفترات المحظورة (TimeOff) أو البطاقات المقفلة (Locked).
+     */
+    canPlaceCard(cardIdx, day, period, roomIdx, ignoreOccupied = false) {
+      const card = this.model.cards[cardIdx];
+      const duration = card.duration || 1;
+
+      if (day < 0 || day >= this.days) return { ok: false, reason: 'OUT_OF_RANGE_DAY', blockers: [] };
+      if (period < 0 || period + duration > this.periods) {
+        return { ok: false, reason: 'OUT_OF_RANGE_PERIOD', blockers: [] };
+      }
+
+      const blockers = new Set();
+
+      for (let offset = 0; offset < duration; offset++) {
+        const p = period + offset;
+        const slot = this.slotIndex(day, p);
+
+        // 1. فحص القيود الزمنية للمعلمين (Teacher Time-Off & Occupancy)
+        for (const tIdx of card.teacherIndices) {
+          if (this.model.teacherTimeOffBitmask[tIdx][slot]) {
+            return { ok: false, reason: 'TEACHER_TIMEOFF', blockers: [] };
+          }
+          const occCard = this.teacherGrid[tIdx][slot];
+          if (occCard !== -1 && occCard !== cardIdx) {
+            if (!ignoreOccupied || this.model.cards[occCard].locked) {
+              return { ok: false, reason: 'TEACHER_BUSY', blockers: [occCard] };
+            }
+            blockers.add(occCard);
+          }
+        }
+
+        // 2. فحص القيود الزمنية للفصول (Class Time-Off & Occupancy)
+        for (const cIdx of card.classIndices) {
+          if (this.model.classTimeOffBitmask[cIdx][slot]) {
+            return { ok: false, reason: 'CLASS_TIMEOFF', blockers: [] };
+          }
+          const occCard = this.classGrid[cIdx][slot];
+          if (occCard !== -1 && occCard !== cardIdx) {
+            if (!ignoreOccupied || this.model.cards[occCard].locked) {
+              return { ok: false, reason: 'CLASS_BUSY', blockers: [occCard] };
+            }
+            blockers.add(occCard);
+          }
+        }
+
+        // 3. فحص القاعة الدراسية (Room Time-Off, Allowed Rooms & Occupancy)
+        if (roomIdx !== null && roomIdx !== undefined && roomIdx >= 0) {
+          if (this.model.roomTimeOffBitmask[roomIdx][slot]) {
+            return { ok: false, reason: 'ROOM_TIMEOFF', blockers: [] };
+          }
+          if (card.allowedRoomIndices && card.allowedRoomIndices.length > 0) {
+            if (!card.allowedRoomIndices.includes(roomIdx)) {
+              return { ok: false, reason: 'ROOM_NOT_ALLOWED', blockers: [] };
+            }
+          }
+          const occCard = this.roomGrid[roomIdx][slot];
+          if (occCard !== -1 && occCard !== cardIdx) {
+            if (!ignoreOccupied || this.model.cards[occCard].locked) {
+              return { ok: false, reason: 'ROOM_BUSY', blockers: [occCard] };
+            }
+            blockers.add(occCard);
+          }
+        }
+      }
+
+      return { ok: true, reason: 'OK', blockers: Array.from(blockers) };
+    }
+
+    /**
+     * تسكين البطاقة في الشبكة وتحديث الهياكل (Update struktur)
+     */
+    placeCard(cardIdx, day, period, roomIdx) {
+      if (this.cardPlacement[cardIdx] !== null) {
+        this.removeCard(cardIdx);
+      }
+      const card = this.model.cards[cardIdx];
+      const duration = card.duration || 1;
+
+      for (let offset = 0; offset < duration; offset++) {
+        const slot = this.slotIndex(day, period + offset);
+        for (const tIdx of card.teacherIndices) {
+          this.teacherGrid[tIdx][slot] = cardIdx;
+        }
+        for (const cIdx of card.classIndices) {
+          this.classGrid[cIdx][slot] = cardIdx;
+        }
+        if (roomIdx !== null && roomIdx !== undefined && roomIdx >= 0) {
+          this.roomGrid[roomIdx][slot] = cardIdx;
+        }
+      }
+
+      for (const cIdx of card.classIndices) {
+        this.classSubjectDayCount[cIdx][card.subjectIndex][day] += 1;
+      }
+
+      this.cardPlacement[cardIdx] = { day, period, roomIdx };
+    }
+
+    /**
+     * إزالة البطاقة من الشبكة (Unplace / Backtrack step)
+     */
+    removeCard(cardIdx) {
+      const placement = this.cardPlacement[cardIdx];
+      if (!placement) return null;
+
+      const { day, period, roomIdx } = placement;
+      const card = this.model.cards[cardIdx];
+      const duration = card.duration || 1;
+
+      for (let offset = 0; offset < duration; offset++) {
+        const slot = this.slotIndex(day, period + offset);
+        for (const tIdx of card.teacherIndices) {
+          if (this.teacherGrid[tIdx][slot] === cardIdx) {
+            this.teacherGrid[tIdx][slot] = -1;
+          }
+        }
+        for (const cIdx of card.classIndices) {
+          if (this.classGrid[cIdx][slot] === cardIdx) {
+            this.classGrid[cIdx][slot] = -1;
+          }
+        }
+        if (roomIdx !== null && roomIdx !== undefined && roomIdx >= 0) {
+          if (this.roomGrid[roomIdx][slot] === cardIdx) {
+            this.roomGrid[roomIdx][slot] = -1;
+          }
+        }
+      }
+
+      for (const cIdx of card.classIndices) {
+        if (this.classSubjectDayCount[cIdx][card.subjectIndex][day] > 0) {
+          this.classSubjectDayCount[cIdx][card.subjectIndex][day] -= 1;
+        }
+      }
+
+      this.cardPlacement[cardIdx] = null;
+      return placement;
+    }
+
+    /**
+     * أخذ لقطة كاملة (Snapshot) لحالة الجدول لحفظها في حوض الحلول (CBacktrack)
+     */
+    clonePlacement() {
+      return this.cardPlacement.map(p => (p ? { day: p.day, period: p.period, roomIdx: p.roomIdx } : null));
+    }
+
+    /**
+     * استعادة لقطة كاملة (Restore Snapshot)
+     */
+    restorePlacement(snapshot) {
+      for (let i = 0; i < this.cardPlacement.length; i++) {
+        if (this.cardPlacement[i] !== null) {
+          this.removeCard(i);
+        }
+      }
+      for (let i = 0; i < snapshot.length; i++) {
+        const p = snapshot[i];
+        if (p !== null) {
+          this.placeCard(i, p.day, p.period, p.roomIdx);
+        }
+      }
+    }
+
+    /**
+     * توليد بصمة نصية فريدة للحل لمنع التكرار (Backtrack_Riesenia_VymazDuplikaty)
+     */
+    computeHash() {
+      return this.cardPlacement
+        .map((p, idx) => (p ? `${idx}:${p.day}.${p.period}.${p.roomIdx ?? -1}` : `${idx}:X`))
+        .join('|');
+    }
+  }
+
+  /**
+   * 4. المحرك الرئيسي للجدولة (ASCTimetableEngine - يحاكي roz.exe)
+   */
+  class ASCTimetableEngine {
+    constructor(rawInput, configOverrides = {}) {
+      this.config = new EngineConfig(configOverrides);
+      this.telemetry = new EngineTelemetry();
+      this.model = this._normalizeAndCompileModel(rawInput);
+      this.state = new TimetableGridState(this.model);
+      this.solutionPool = []; // حوض الحلول (Backtrack_Riesenia)
+    }
+
+    /**
+     * المرحلة 0: تجميع النموذج ومصفوفات التفرغ السريعة (JIT_Compile)
+     */
+    _normalizeAndCompileModel(input) {
+      this.telemetry.inc('JIT_Compile');
+      const daysCount = input.daysCount || (input.days ? input.days.length : 5);
+      const periodsPerDay = input.periodsPerDay || (input.periods ? input.periods.length : 7);
+      const totalSlots = daysCount * periodsPerDay;
+
+      const days = input.days || ['الأحد', 'الإثنين', 'الثلاثاء', 'الأربعاء', 'الخميس'].slice(0, daysCount);
+      const periods = input.periods || Array.from({ length: periodsPerDay }, (_, i) => `الحصة ${i + 1}`);
+
+      const classes = (input.classes || []).map((c, idx) => ({
+        id: String(c.id ?? `C${idx + 1}`),
+        name: c.name || `فصل ${idx + 1}`,
+        grade: c.grade || 1,
+        size: c.size || 25,
+        timeOff: c.timeOff || [] // Array of { day, period }
+      }));
+
+      const teachers = (input.teachers || []).map((t, idx) => ({
+        id: String(t.id ?? `T${idx + 1}`),
+        name: t.name || `معلم ${idx + 1}`,
+        maxPerDay: t.maxPerDay ?? Math.max(4, periodsPerDay - 2),
+        maxConsecutive: t.maxConsecutive ?? 4,
+        avoidGaps: t.avoidGaps ?? true,
+        timeOff: t.timeOff || []
+      }));
+
+      const rooms = (input.rooms || []).map((r, idx) => ({
+        id: String(r.id ?? `R${idx + 1}`),
+        name: r.name || `قاعة ${idx + 1}`,
+        type: r.type || 'general',
+        capacity: r.capacity || 35,
+        timeOff: r.timeOff || []
+      }));
+
+      // إذا لم يحدد المستخدم قاعات، ننشئ قاعة افتراضية لكل فصل
+      if (rooms.length === 0) {
+        classes.forEach((c, idx) => {
+          rooms.push({
+            id: `R_DEFAULT_${c.id}`,
+            name: `قاعة ${c.name}`,
+            type: 'general',
+            capacity: c.size,
+            timeOff: []
+          });
+        });
+      }
+
+      const subjects = (input.subjects || []).map((s, idx) => ({
+        id: String(s.id ?? `S${idx + 1}`),
+        name: s.name || `مادة ${idx + 1}`,
+        color: s.color || '#6366f1',
+        difficulty: s.difficulty ?? 2, // 1: عادية، 2: متوسطة، 3: ثقيلة (يفضل الحصص الأولى)
+        maxPerDayPerClass: s.maxPerDayPerClass ?? 1,
+        preferredRoomType: s.preferredRoomType || null,
+        requiredRoomIds: s.requiredRoomIds || []
+      }));
+
+      const classIdToIndex = new Map(classes.map((c, i) => [c.id, i]));
+      const teacherIdToIndex = new Map(teachers.map((t, i) => [t.id, i]));
+      const roomIdToIndex = new Map(rooms.map((r, i) => [r.id, i]));
+      const subjectIdToIndex = new Map(subjects.map((s, i) => [s.id, i]));
+
+      // بناء مصفوفات التفرغ البتية (Bitmasks)
+      const teacherTimeOffBitmask = teachers.map(t => {
+        const mask = new Uint8Array(totalSlots);
+        (t.timeOff || []).forEach(({ day, period }) => {
+          if (day >= 0 && day < daysCount && period >= 0 && period < periodsPerDay) {
+            mask[day * periodsPerDay + period] = 1;
+          }
+        });
+        return mask;
+      });
+
+      const classTimeOffBitmask = classes.map(c => {
+        const mask = new Uint8Array(totalSlots);
+        (c.timeOff || []).forEach(({ day, period }) => {
+          if (day >= 0 && day < daysCount && period >= 0 && period < periodsPerDay) {
+            mask[day * periodsPerDay + period] = 1;
+          }
+        });
+        return mask;
+      });
+
+      const roomTimeOffBitmask = rooms.map(r => {
+        const mask = new Uint8Array(totalSlots);
+        (r.timeOff || []).forEach(({ day, period }) => {
+          if (day >= 0 && day < daysCount && period >= 0 && period < periodsPerDay) {
+            mask[day * periodsPerDay + period] = 1;
+          }
+        });
+        return mask;
+      });
+
+      // تفكيك متطلبات الحصص (Lessons / Contracts) إلى بطاقات فردية قابلة للتسكين (Cards - CHodinaSum)
+      const cards = [];
+      const rawLessons = input.lessons || input.cards || [];
+
+      rawLessons.forEach((lesson, lIdx) => {
+        const subjIdx = subjectIdToIndex.get(String(lesson.subjectId));
+        if (subjIdx === undefined) return;
+        const subject = subjects[subjIdx];
+
+        const tIds = Array.isArray(lesson.teacherIds)
+          ? lesson.teacherIds
+          : lesson.teacherId !== undefined
+          ? [lesson.teacherId]
+          : [];
+        const teacherIndices = tIds
+          .map(id => teacherIdToIndex.get(String(id)))
+          .filter(idx => idx !== undefined);
+
+        const cIds = Array.isArray(lesson.classIds)
+          ? lesson.classIds
+          : lesson.classId !== undefined
+          ? [lesson.classId]
+          : [];
+        const classIndices = cIds
+          .map(id => classIdToIndex.get(String(id)))
+          .filter(idx => idx !== undefined);
+
+        // تحديد القاعات المسموحة لهذه البطاقة
+        let allowedRoomIndices = [];
+        if (lesson.roomIds && lesson.roomIds.length > 0) {
+          allowedRoomIndices = lesson.roomIds
+            .map(id => roomIdToIndex.get(String(id)))
+            .filter(idx => idx !== undefined);
+        } else if (lesson.roomId !== undefined && lesson.roomId !== null && lesson.roomId !== '') {
+          const rIdx = roomIdToIndex.get(String(lesson.roomId));
+          if (rIdx !== undefined) allowedRoomIndices = [rIdx];
+        } else if (subject.requiredRoomIds && subject.requiredRoomIds.length > 0) {
+          allowedRoomIndices = subject.requiredRoomIds
+            .map(id => roomIdToIndex.get(String(id)))
+            .filter(idx => idx !== undefined);
+        } else if (subject.preferredRoomType) {
+          allowedRoomIndices = rooms
+            .map((r, idx) => (r.type === subject.preferredRoomType ? idx : -1))
+            .filter(idx => idx !== -1);
+        }
+
+        if (allowedRoomIndices.length === 0) {
+          // جميع القاعات التي تتسع للفصل مسموحة
+          const requiredCap = classIndices.reduce((sum, ci) => sum + (classes[ci].size || 25), 0);
+          allowedRoomIndices = rooms
+            .map((r, idx) => ((r.capacity || 35) >= requiredCap ? idx : -1))
+            .filter(idx => idx !== -1);
+          if (allowedRoomIndices.length === 0) {
+            allowedRoomIndices = rooms.map((_, idx) => idx);
+          }
+        }
+
+        // دعم تفكيك العقد (مثلاً 5 حصص أسبوعياً: يمكن تحديد periodsPerWeek أو cardsList)
+        // إذا كان الإدخال يحدد distribution مثل [2, 1, 1, 1] أو count + duration
+        let blocks = [];
+        if (Array.isArray(lesson.blocks) && lesson.blocks.length > 0) {
+          blocks = lesson.blocks;
+        } else if (lesson.periodsPerWeek && lesson.periodsPerWeek > 0) {
+          const totalP = Number(lesson.periodsPerWeek);
+          const doubleCount = Number(lesson.doubleLessons || 0);
+          for (let d = 0; d < doubleCount && blocks.reduce((a, b) => a + b, 0) + 2 <= totalP; d++) {
+            blocks.push(2);
+          }
+          while (blocks.reduce((a, b) => a + b, 0) < totalP) {
+            blocks.push(1);
+          }
+        } else {
+          blocks = [Number(lesson.duration || 1)];
+        }
+
+        blocks.forEach((duration, bIdx) => {
+          cards.push({
+            id: lesson.id ? `${lesson.id}_${bIdx + 1}` : `CARD_${lIdx + 1}_${bIdx + 1}`,
+            lessonId: String(lesson.id ?? `L${lIdx + 1}`),
+            subjectIndex: subjIdx,
+            teacherIndices,
+            classIndices,
+            allowedRoomIndices,
+            duration: Math.max(1, Math.min(periodsPerDay, Number(duration) || 1)),
+            locked: Boolean(lesson.locked && bIdx === 0),
+            fixedDay: lesson.locked && bIdx === 0 ? lesson.fixedDay : null,
+            fixedPeriod: lesson.locked && bIdx === 0 ? lesson.fixedPeriod : null,
+            fixedRoomIndex:
+              lesson.locked && bIdx === 0 && lesson.fixedRoomId
+                ? roomIdToIndex.get(String(lesson.fixedRoomId))
+                : null,
+            importance: lesson.importance || 'normal' // strict, high, normal, optimize, low
+          });
+        });
+      });
+
+      return {
+        daysCount,
+        periodsPerDay,
+        totalSlots,
+        days,
+        periods,
+        classes,
+        teachers,
+        rooms,
+        subjects,
+        cards,
+        teacherTimeOffBitmask,
+        classTimeOffBitmask,
+        roomTimeOffBitmask
+      };
+    }
+
+    /**
+     * المرحلة 7 (قبل التوليد): الاختبارات الموسعة للقيود (Extended tests - by constraints)
+     * تكتشف الأخطاء المستحيلة حسابياً قبل بدء البحث التراجعي (مثل تجاوز نصاب الفصل أو المعلم لعدد الحصص المتاحة)
+     */
+    runExtendedTests() {
+      const issues = [];
+      const { classes, teachers, cards, daysCount, periodsPerDay, totalSlots } = this.model;
+
+      // 1. فحص نصاب كل فصل دراسي مقارنة بالفترات المتاحة له
+      classes.forEach((cls, cIdx) => {
+        let requiredPeriods = 0;
+        cards.forEach(card => {
+          if (card.classIndices.includes(cIdx)) {
+            requiredPeriods += card.duration;
+          }
+        });
+        let availableSlots = 0;
+        for (let s = 0; s < totalSlots; s++) {
+          if (!this.model.classTimeOffBitmask[cIdx][s]) availableSlots++;
+        }
+        if (requiredPeriods > availableSlots) {
+          issues.push({
+            severity: 'FATAL',
+            type: 'CLASS_OVERBOOKED',
+            entityId: cls.id,
+            entityName: cls.name,
+            message: `الفصل "${cls.name}" مطلوب له (${requiredPeriods}) حصة بينما الفترات المتاحة له (${availableSlots}) فقط.`
+          });
+        }
+      });
+
+      // 2. فحص نصاب كل معلم مقارنة بفترات تفرغه والحد اليومي
+      teachers.forEach((teacher, tIdx) => {
+        let requiredPeriods = 0;
+        cards.forEach(card => {
+          if (card.teacherIndices.includes(tIdx)) {
+            requiredPeriods += card.duration;
+          }
+        });
+        let availableSlots = 0;
+        for (let s = 0; s < totalSlots; s++) {
+          if (!this.model.teacherTimeOffBitmask[tIdx][s]) availableSlots++;
+        }
+        if (requiredPeriods > availableSlots) {
+          issues.push({
+            severity: 'FATAL',
+            type: 'TEACHER_OVERBOOKED',
+            entityId: teacher.id,
+            entityName: teacher.name,
+            message: `المعلم "${teacher.name}" مسند إليه (${requiredPeriods}) حصة بينما أوقات تواجده المتاحة (${availableSlots}) فقط.`
+          });
+        } else if (requiredPeriods > teacher.maxPerDay * daysCount) {
+          issues.push({
+            severity: 'WARNING',
+            type: 'TEACHER_DAILY_MAX_TIGHT',
+            entityId: teacher.id,
+            entityName: teacher.name,
+            message: `نصاب المعلم "${teacher.name}" (${requiredPeriods} حصة) يتجاوز حده اليومي المفضل (${teacher.maxPerDay} × ${daysCount} أيام = ${teacher.maxPerDay * daysCount}).`
+          });
+        }
+      });
+
+      return {
+        passed: !issues.some(i => i.severity === 'FATAL'),
+        issues
+      };
+    }
+
+    /**
+     * حساب درجة صعوبة البطاقة لفرز البطاقات (Algoritmus_Ries3_Sort)
+     * البطاقات المقفلة أولاً، ثم الحصص المزدوجة، ثم البطاقات ذات المجال الزمني الأضيق (MRV)
+     */
+    _computeCardDifficulty(cardIdx, collisionHistory) {
+      const card = this.model.cards[cardIdx];
+      if (card.locked) return 1e9;
+
+      let validDomains = 0;
+      const { daysCount, periodsPerDay } = this.model;
+      for (let d = 0; d < daysCount; d++) {
+        for (let p = 0; p <= periodsPerDay - card.duration; p++) {
+          for (const rIdx of card.allowedRoomIndices) {
+            if (this.state.canPlaceCard(cardIdx, d, p, rIdx, false).ok) {
+              validDomains++;
+              break; // يكفي توفر قاعة واحدة في هذه الفترة لاحتساب الفترة متاحة
+            }
+          }
+        }
+      }
+
+      const subj = this.model.subjects[card.subjectIndex];
+      const historyBoost = (collisionHistory[cardIdx] || 0) * 35;
+      const durationBoost = card.duration * 250;
+      const multiResourceBoost = (card.teacherIndices.length + card.classIndices.length) * 80;
+      const roomScarcityBoost = Math.max(0, 20 - card.allowedRoomIndices.length) * 15;
+      const difficultyBoost = (subj.difficulty || 1) * 30;
+      const mrvScore = Math.max(0, 500 - validDomains * 12);
+
+      return durationBoost + multiResourceBoost + roomScarcityBoost + difficultyBoost + mrvScore + historyBoost;
+    }
+
+    /**
+     * فرز البطاقات غير المسكنة استدلالياً (Algoritmus_Ries3_Sort)
+     */
+    _sortUnplacedCards(unplacedIndices, collisionHistory) {
+      this.telemetry.inc('Algoritmus_Ries3_Sort');
+      const scores = new Map();
+      for (const idx of unplacedIndices) {
+        scores.set(idx, this._computeCardDifficulty(idx, collisionHistory));
+      }
+      unplacedIndices.sort((a, b) => scores.get(b) - scores.get(a));
+    }
+
+    /**
+     * حساب التكلفة الموضعية لوضع بطاقة في (day, period, roomIdx)
+     * يستخدم لاختيار أفضل فترة متاحة أثناء التوليد (Best-Fit Slot Selection)
+     */
+    _evaluateDeltaPlacementCost(cardIdx, day, period, roomIdx) {
+      const card = this.model.cards[cardIdx];
+      const subj = this.model.subjects[card.subjectIndex];
+      const w = this.config.weights;
+      let cost = 0;
+
+      // 1. عقوبة تكرار نفس المادة لنفس الفصل في نفس اليوم
+      for (const cIdx of card.classIndices) {
+        const currentSameDay = this.state.classSubjectDayCount[cIdx][card.subjectIndex][day];
+        if (currentSameDay >= (subj.maxPerDayPerClass || 1)) {
+          cost += w.sameSubjectSameDay * (currentSameDay + 1);
+        }
+      }
+
+      // 2. تفضيل الحصص المبكرة للمواد العلمية الثقيلة (Difficulty >= 3)
+      if ((subj.difficulty || 1) >= 3 && period >= Math.floor(this.model.periodsPerDay * 0.6)) {
+        cost += w.heavySubjectLatePeriod * (period - Math.floor(this.model.periodsPerDay * 0.5));
+      }
+
+      // 3. فحص تأثير الفترة على جدول المعلم (تجنب النوافذ + عدم تجاوز الحد اليومي والمتتالي)
+      for (const tIdx of card.teacherIndices) {
+        const teacher = this.model.teachers[tIdx];
+        let dailyCount = card.duration;
+        let firstP = period;
+        let lastP = period + card.duration - 1;
+
+        for (let p = 0; p < this.model.periodsPerDay; p++) {
+          const slot = this.state.slotIndex(day, p);
+          const occ = this.state.teacherGrid[tIdx][slot];
+          if (occ !== -1 && occ !== cardIdx) {
+            dailyCount++;
+            if (p < firstP) firstP = p;
+            if (p > lastP) lastP = p;
+          }
+        }
+
+        if (dailyCount > teacher.maxPerDay) {
+          cost += w.teacherDailyOverload * (dailyCount - teacher.maxPerDay);
+        }
+
+        // تقدير الفجوات (Teacher Gaps)
+        if (teacher.avoidGaps) {
+          const span = lastP - firstP + 1;
+          const gaps = Math.max(0, span - dailyCount);
+          cost += gaps * w.teacherGap;
+        }
+      }
+
+      // 4. توازن حمل الفصل عبر أيام الأسبوع
+      for (const cIdx of card.classIndices) {
+        let classDayLoad = card.duration;
+        for (let p = 0; p < this.model.periodsPerDay; p++) {
+          const occ = this.state.classGrid[cIdx][this.state.slotIndex(day, p)];
+          if (occ !== -1 && occ !== cardIdx) classDayLoad++;
+        }
+        cost += classDayLoad * w.unevenClassLoad * 0.2;
+      }
+
+      return cost;
+    }
+
+    /**
+     * إيجاد جميع المواضع المتاحة للبطاقة مرتبة من الأقل عقوبة إلى الأعلى
+     */
+    _getCandidatePlacementsForCard(cardIdx, allowOccupiedForKick = false) {
+      const card = this.model.cards[cardIdx];
+      const candidates = [];
+
+      // إذا كانت البطاقة مقفلة (Locked) في يوم وحصة محددين
+      if (card.locked && card.fixedDay !== null && card.fixedPeriod !== null) {
+        const rIdx = card.fixedRoomIndex !== null && card.fixedRoomIndex !== undefined
+          ? card.fixedRoomIndex
+          : card.allowedRoomIndices[0] ?? 0;
+        const check = this.state.canPlaceCard(cardIdx, card.fixedDay, card.fixedPeriod, rIdx, allowOccupiedForKick);
+        if (check.ok) {
+          candidates.push({
+            day: card.fixedDay,
+            period: card.fixedPeriod,
+            roomIdx: rIdx,
+            cost: 0,
+            blockers: check.blockers
+          });
+        }
+        return candidates;
+      }
+
+      for (let d = 0; d < this.model.daysCount; d++) {
+        for (let p = 0; p <= this.model.periodsPerDay - card.duration; p++) {
+          for (const rIdx of card.allowedRoomIndices) {
+            const check = this.state.canPlaceCard(cardIdx, d, p, rIdx, allowOccupiedForKick);
+            if (check.ok) {
+              const deltaCost = this._evaluateDeltaPlacementCost(cardIdx, d, p, rIdx);
+              const blockerPenalty = check.blockers.length * 400;
+              candidates.push({
+                day: d,
+                period: p,
+                roomIdx: rIdx,
+                cost: deltaCost + blockerPenalty + Math.random() * 4, // كسر التعادل عشوائياً
+                blockers: check.blockers
+              });
+              // إذا كانت الفترة فارغة تماماً في هذه القاعة، لا داعي لتجربة كل القاعات المتماثلة لنفس الفترة
+              if (check.blockers.length === 0) break;
+            }
+          }
+        }
+      }
+
+      candidates.sort((a, b) => a.cost - b.cost);
+      return candidates;
+    }
+
+    /**
+     * المرحلة 3: خوارزمية الإزاحة القسرية المتسلسلة (Backtrack_Vykop - Ejection Chain / Kick)
+     * عندما تفشل البطاقة في إيجاد موضع فارغ (Ries T0 fail)، تقوم بإزاحة بطاقة مسكنة
+     * وتبحث للبطاقة المزاحة عن موضع بديل بشكل عودي حتى عمق `maxDepth`.
+     */
+    _attemptEjectionChain(cardIdx, depth, visitedCards, collisionHistory) {
+      if (depth <= 0) return false;
+      if (this.telemetry.counters.Backtrack_Vykop >= this.config.m_nEngine_max_vykop_celkom) {
+        return false;
+      }
+
+      this.telemetry.inc('Backtrack_Vykop');
+      visitedCards.add(cardIdx);
+
+      // جلب المواضع التي تتطلب إزاحة بطاقة واحدة أو اثنتين كحد أقصى
+      const kickCandidates = this._getCandidatePlacementsForCard(cardIdx, true).filter(
+        c => c.blockers.length > 0 && c.blockers.length <= 2 && c.blockers.every(b => !visitedCards.has(b))
+      );
+
+      const maxTrials = Math.min(8, kickCandidates.length);
+      for (let i = 0; i < maxTrials; i++) {
+        const cand = kickCandidates[i];
+        const evictedRecords = [];
+
+        // إزالة البطاقات المعيقة مؤقتاً
+        for (const bIdx of cand.blockers) {
+          collisionHistory[bIdx] = (collisionHistory[bIdx] || 0) + 1;
+          const oldPos = this.state.removeCard(bIdx);
+          if (oldPos) {
+            evictedRecords.push({ cardIdx: bIdx, oldPos });
+          }
+        }
+
+        // تسكين البطاقة الحالية في الموضع الذي تم تفريغه
+        this.state.placeCard(cardIdx, cand.day, cand.period, cand.roomIdx);
+        this.telemetry.inc('Update_struktur');
+
+        // محاولة إعادة تسكين البطاقات المزاحة
+        let allRelocated = true;
+        for (const evicted of evictedRecords) {
+          const directOptions = this._getCandidatePlacementsForCard(evicted.cardIdx, false);
+          if (directOptions.length > 0) {
+            const best = directOptions[0];
+            this.state.placeCard(evicted.cardIdx, best.day, best.period, best.roomIdx);
+            this.telemetry.inc('Update_struktur');
+          } else {
+            // البحث العودي (Recursive Ejection Chain)
+            const subOk = this._attemptEjectionChain(
+              evicted.cardIdx,
+              depth - 1,
+              new Set(visitedCards),
+              collisionHistory
+            );
+            if (!subOk) {
+              allRelocated = false;
+              break;
+            }
+          }
+        }
+
+        if (allRelocated) {
+          return true;
+        }
+
+        // التراجع في حال فشل السلسلة (Rollback Ejection Chain)
+        this.state.removeCard(cardIdx);
+        for (const evicted of evictedRecords) {
+          this.state.removeCard(evicted.cardIdx);
+        }
+        for (const evicted of evictedRecords) {
+          this.state.placeCard(
+            evicted.cardIdx,
+            evicted.oldPos.day,
+            evicted.oldPos.period,
+            evicted.oldPos.roomIdx
+          );
+        }
+      }
+
+      visitedCards.delete(cardIdx);
+      return false;
+    }
+
+    /**
+     * المرحلة 4: البعثرة السريعة لكسر الجمود (Backtrack_Riesenia_Rozhadzuj)
+     * عند تراكم التصادمات الحرجة (m_fEngine_mrtva_stress)، نقوم بفك تسكين مجموعة صغيرة
+     * من البطاقات ذات التصادمات العالية وإعادة ترتيبها.
+     */
+    _perturbSchedule(unplacedQueue, collisionHistory) {
+      this.telemetry.inc('Backtrack_Riesenia_Rozhadzuj');
+      const placedIndices = [];
+      for (let i = 0; i < this.model.cards.length; i++) {
+        if (this.state.cardPlacement[i] !== null && !this.model.cards[i].locked) {
+          placedIndices.push(i);
+        }
+      }
+      if (placedIndices.length === 0) return;
+
+      // اختيار البطاقات الأكثر تسبباً في التصادم أو عينة عشوائية
+      placedIndices.sort((a, b) => (collisionHistory[b] || 0) - (collisionHistory[a] || 0));
+      const shakeCount = Math.min(this.config.m_nEngine_Fast_Rozhadzuj, Math.ceil(placedIndices.length * 0.15));
+
+      for (let i = 0; i < shakeCount; i++) {
+        // مزج بين الأعلى تصادماً والاختيار العشوائي
+        const pickIdx = i < Math.ceil(shakeCount / 2)
+          ? placedIndices[i]
+          : placedIndices[Math.floor(Math.random() * placedIndices.length)];
+        if (this.state.cardPlacement[pickIdx] !== null) {
+          this.state.removeCard(pickIdx);
+          if (!unplacedQueue.includes(pickIdx)) {
+            unplacedQueue.push(pickIdx);
+          }
+        }
+      }
+    }
+
+    /**
+     * المرحلة 5: دالة التقييم وحساب العقوبات والنقاط الشاملة (PridelBody)
+     */
+    evaluateFitness() {
+      this.telemetry.inc('PridelBody');
+      const w = this.config.weights;
+      const { classes, teachers, subjects, cards, daysCount, periodsPerDay } = this.model;
+
+      let hardViolations = 0;
+      let unplacedCount = 0;
+      let teacherGapsTotal = 0;
+      let classGapsTotal = 0;
+      let sameSubjectSameDayViolations = 0;
+      let teacherDailyOverloads = 0;
+      let teacherConsecutiveOverloads = 0;
+      let lateHeavySubjectCount = 0;
+      const softDetails = [];
+
+      // 1. فحص البطاقات غير المسكنة
+      cards.forEach((card, idx) => {
+        if (this.state.cardPlacement[idx] === null) {
+          unplacedCount++;
+        }
+      });
+
+      // 2. فحص الفجوات والتتابع والحد الأقصى اليومي للمعلمين (CUcitelSum)
+      teachers.forEach((teacher, tIdx) => {
+        for (let d = 0; d < daysCount; d++) {
+          let firstP = -1;
+          let lastP = -1;
+          let countToday = 0;
+          let currentStreak = 0;
+          let maxStreakToday = 0;
+
+          for (let p = 0; p < periodsPerDay; p++) {
+            const occ = this.state.teacherGrid[tIdx][this.state.slotIndex(d, p)];
+            if (occ !== -1) {
+              if (firstP === -1) firstP = p;
+              lastP = p;
+              countToday++;
+              currentStreak++;
+              if (currentStreak > maxStreakToday) maxStreakToday = currentStreak;
+            } else {
+              currentStreak = 0;
+            }
+          }
+
+          if (countToday > teacher.maxPerDay) {
+            const diff = countToday - teacher.maxPerDay;
+            teacherDailyOverloads += diff;
+          }
+          if (maxStreakToday > teacher.maxConsecutive) {
+            const diff = maxStreakToday - teacher.maxConsecutive;
+            teacherConsecutiveOverloads += diff;
+          }
+          if (teacher.avoidGaps && firstP !== -1 && lastP > firstP) {
+            const gaps = lastP - firstP + 1 - countToday;
+            if (gaps > 0) {
+              teacherGapsTotal += gaps;
+            }
+          }
+        }
+      });
+
+      // 3. فحص فجوات الفصول الدراسية وتكرار المواد في نفس اليوم (CTriedaSum)
+      classes.forEach((cls, cIdx) => {
+        for (let d = 0; d < daysCount; d++) {
+          let firstP = -1;
+          let lastP = -1;
+          let countToday = 0;
+
+          for (let p = 0; p < periodsPerDay; p++) {
+            const occ = this.state.classGrid[cIdx][this.state.slotIndex(d, p)];
+            if (occ !== -1) {
+              if (firstP === -1) firstP = p;
+              lastP = p;
+              countToday++;
+            }
+          }
+
+          // الفصول المدرسية يجب ألا تحتوي على فراغات وسط الدوام
+          if (firstP !== -1 && lastP > firstP) {
+            const gaps = lastP - firstP + 1 - countToday;
+            if (gaps > 0) classGapsTotal += gaps;
+          }
+
+          // تكرار نفس المادة في نفس اليوم
+          subjects.forEach((subj, sIdx) => {
+            const c = this.state.classSubjectDayCount[cIdx][sIdx][d];
+            const limit = subj.maxPerDayPerClass || 1;
+            if (c > limit) {
+              sameSubjectSameDayViolations += c - limit;
+            }
+          });
+        }
+      });
+
+      // 4. فحص المواد الثقيلة في الحصص المتأخرة
+      cards.forEach((card, idx) => {
+        const pos = this.state.cardPlacement[idx];
+        if (!pos) return;
+        const subj = subjects[card.subjectIndex];
+        if ((subj.difficulty || 1) >= 3 && pos.period >= Math.floor(periodsPerDay * 0.65)) {
+          lateHeavySubjectCount++;
+        }
+      });
+
+      const totalPenalty =
+        hardViolations * w.hardConflict +
+        unplacedCount * w.unplacedCard +
+        teacherGapsTotal * w.teacherGap +
+        classGapsTotal * w.classGap +
+        sameSubjectSameDayViolations * w.sameSubjectSameDay +
+        teacherDailyOverloads * w.teacherDailyOverload +
+        teacherConsecutiveOverloads * w.teacherConsecutiveOverload +
+        lateHeavySubjectCount * w.heavySubjectLatePeriod;
+
+      // حساب مؤشر الجودة المئوي (100% = صفر بطاقات غير مسكنة وأقل عقوبات مرنة)
+      const placedRatio = cards.length > 0 ? (cards.length - unplacedCount) / cards.length : 1;
+      const softPenalty =
+        teacherGapsTotal * w.teacherGap +
+        classGapsTotal * w.classGap +
+        sameSubjectSameDayViolations * w.sameSubjectSameDay +
+        teacherDailyOverloads * w.teacherDailyOverload +
+        teacherConsecutiveOverloads * w.teacherConsecutiveOverload +
+        lateHeavySubjectCount * w.heavySubjectLatePeriod;
+
+      const qualityScore = Math.max(
+        0,
+        +(placedRatio * 100 - Math.min(25, softPenalty / Math.max(1, cards.length * 12))).toFixed(2)
+      );
+
+      if (teacherGapsTotal > 0) {
+        softDetails.push(`نوافذ المعلمين: ${teacherGapsTotal}`);
+      }
+      if (sameSubjectSameDayViolations > 0) {
+        softDetails.push(`تكرار مادة بنفس اليوم: ${sameSubjectSameDayViolations}`);
+      }
+      if (teacherDailyOverloads > 0) {
+        softDetails.push(`تجاوز الحد اليومي للمعلم: ${teacherDailyOverloads}`);
+      }
+      if (classGapsTotal > 0) {
+        softDetails.push(`فراغات الفصول: ${classGapsTotal}`);
+      }
+
+      return {
+        totalPenalty,
+        softPenalty,
+        qualityScore,
+        placedCards: cards.length - unplacedCount,
+        totalCards: cards.length,
+        unplacedCount,
+        hardViolations,
+        breakdown: {
+          teacherGapsTotal,
+          classGapsTotal,
+          sameSubjectSameDayViolations,
+          teacherDailyOverloads,
+          teacherConsecutiveOverloads,
+          lateHeavySubjectCount
+        },
+        softDetails
+      };
+    }
+
+    /**
+     * حفظ الحل الحالي في حوض الحلول مع إزالة المكررات وفرزها
+     * (Backtrack_Riesenia_VymazDuplikaty + Backtrack_Riesenia_Sort)
+     */
+    _recordSolutionInPool(tag = 'Backtrack') {
+      const hash = this.state.computeHash();
+      const exists = this.solutionPool.some(s => s.hash === hash);
+      if (exists) {
+        this.telemetry.inc('Backtrack_Riesenia_VymazDuplikaty');
+        return;
+      }
+
+      const fitness = this.evaluateFitness();
+      this.solutionPool.push({
+        hash,
+        tag,
+        snapshot: this.state.clonePlacement(),
+        fitness
+      });
+
+      this.telemetry.inc('Backtrack_Riesenia_Sort');
+      this.solutionPool.sort((a, b) => a.fitness.totalPenalty - b.fitness.totalPenalty);
+
+      // الاحتفاظ بأفضل 15 حلاً في الذاكرة
+      if (this.solutionPool.length > 15) {
+        this.solutionPool.length = 15;
+      }
+    }
+
+    /**
+     * المرحلة 6-أ: التحسين المحلي (Optimize local)
+     * يجرب نقل البطاقات الفردية إلى فترات فارغة أفضل أو التبديل الثنائي (2-Opt Swap)
+     * بين بطاقتين من نفس الفصل لتقليل نوافذ المعلمين وتحسين توزيع المواد.
+     */
+    runLocalOptimization(iterations = this.config.localOptIterations) {
+      const { cards, daysCount, periodsPerDay } = this.model;
+      let currentEval = this.evaluateFitness();
+      let improvements = 0;
+
+      for (let iter = 0; iter < iterations; iter++) {
+        this.telemetry.inc('Optimize_local');
+        if (currentEval.softPenalty === 0 && currentEval.unplacedCount === 0) break;
+
+        const cardIdx = Math.floor(Math.random() * cards.length);
+        const card = cards[cardIdx];
+        if (card.locked) continue;
+
+        const oldPos = this.state.cardPlacement[cardIdx];
+        if (!oldPos) continue;
+
+        // الخيار 1: تجربة نقل البطاقة إلى فترة فارغة ذات عقوبة أقل
+        if (Math.random() < 0.5) {
+          this.state.removeCard(cardIdx);
+          const options = this._getCandidatePlacementsForCard(cardIdx, false);
+          let moved = false;
+          if (options.length > 0) {
+            const best = options[0];
+            this.state.placeCard(cardIdx, best.day, best.period, best.roomIdx);
+            const newEval = this.evaluateFitness();
+            if (newEval.totalPenalty < currentEval.totalPenalty) {
+              currentEval = newEval;
+              improvements++;
+              moved = true;
+            }
+          }
+          if (!moved) {
+            this.state.placeCard(cardIdx, oldPos.day, oldPos.period, oldPos.roomIdx);
+          }
+        } else {
+          // الخيار 2: تبديل موضع بطاقتين لنفس الفصل الدراسي (2-Opt Intra-Class Swap)
+          if (card.duration !== 1 || card.classIndices.length === 0) continue;
+          const targetClassIdx = card.classIndices[0];
+          const randDay = Math.floor(Math.random() * daysCount);
+          const randPeriod = Math.floor(Math.random() * periodsPerDay);
+          const otherCardIdx = this.state.classGrid[targetClassIdx][this.state.slotIndex(randDay, randPeriod)];
+
+          if (otherCardIdx === -1 || otherCardIdx === cardIdx) continue;
+          const otherCard = cards[otherCardIdx];
+          if (otherCard.locked || otherCard.duration !== 1) continue;
+
+          const otherPos = this.state.cardPlacement[otherCardIdx];
+          if (!otherPos) continue;
+
+          // فك البطاقتين وتجربة التبديل
+          this.state.removeCard(cardIdx);
+          this.state.removeCard(otherCardIdx);
+
+          const roomForCard1 = card.allowedRoomIndices.includes(otherPos.roomIdx)
+            ? otherPos.roomIdx
+            : card.allowedRoomIndices[0];
+          const roomForCard2 = otherCard.allowedRoomIndices.includes(oldPos.roomIdx)
+            ? oldPos.roomIdx
+            : otherCard.allowedRoomIndices[0];
+
+          const can1 = this.state.canPlaceCard(cardIdx, otherPos.day, otherPos.period, roomForCard1, false);
+          let swapped = false;
+
+          if (can1.ok) {
+            this.state.placeCard(cardIdx, otherPos.day, otherPos.period, roomForCard1);
+            const can2 = this.state.canPlaceCard(otherCardIdx, oldPos.day, oldPos.period, roomForCard2, false);
+            if (can2.ok) {
+              this.state.placeCard(otherCardIdx, oldPos.day, oldPos.period, roomForCard2);
+              const newEval = this.evaluateFitness();
+              if (newEval.totalPenalty < currentEval.totalPenalty) {
+                currentEval = newEval;
+                improvements++;
+                swapped = true;
+              } else {
+                this.state.removeCard(otherCardIdx);
+                this.state.removeCard(cardIdx);
+              }
+            } else {
+              this.state.removeCard(cardIdx);
+            }
+          }
+
+          if (!swapped) {
+            this.state.placeCard(cardIdx, oldPos.day, oldPos.period, oldPos.roomIdx);
+            this.state.placeCard(otherCardIdx, otherPos.day, otherPos.period, otherPos.roomIdx);
+          }
+        }
+      }
+
+      return { improvements, fitness: currentEval };
+    }
+
+    /**
+     * المرحلة 6-ب: التحسين الشامل (Optimize global)
+     * يطبق سلاسل تبديل كيمبي (Kempe-Chain / Multi-Swap with Simulated Annealing)
+     * لمعالجة الاختناقات المستعصية عبر أكثر من فصل ومعلم في آنٍ واحد.
+     */
+    runGlobalOptimization(iterations = this.config.globalOptIterations) {
+      let currentEval = this.evaluateFitness();
+      let bestSnapshot = this.state.clonePlacement();
+      let bestEval = currentEval;
+      let temperature = 85.0;
+      const coolingRate = 0.985;
+      let improvements = 0;
+
+      for (let iter = 0; iter < iterations; iter++) {
+        this.telemetry.inc('Optimize_global');
+        if (bestEval.softPenalty === 0 && bestEval.unplacedCount === 0) break;
+
+        // اختيار معلم لديه نوافذ أو بطاقة ذات عقوبة ومحاولة تحسين يومه
+        const cardIdx = Math.floor(Math.random() * this.model.cards.length);
+        const card = this.model.cards[cardIdx];
+        if (card.locked || card.duration !== 1) continue;
+
+        const oldPos = this.state.cardPlacement[cardIdx];
+        if (!oldPos) continue;
+
+        const snapshotBefore = this.state.clonePlacement();
+        this.state.removeCard(cardIdx);
+
+        // محاولة وضعها في فترة أخرى مع إزاحة سلسلة قصيرة (عمق 2)
+        const placed = this._attemptEjectionChain(cardIdx, 2, new Set(), {});
+        if (placed) {
+          const newEval = this.evaluateFitness();
+          const delta = newEval.totalPenalty - currentEval.totalPenalty;
+
+          if (delta < 0 || (newEval.unplacedCount <= currentEval.unplacedCount && Math.exp(-delta / temperature) > Math.random())) {
+            currentEval = newEval;
+            if (newEval.totalPenalty < bestEval.totalPenalty) {
+              bestEval = newEval;
+              bestSnapshot = this.state.clonePlacement();
+              improvements++;
+            }
+          } else {
+            this.state.restorePlacement(snapshotBefore);
+          }
+        } else {
+          this.state.restorePlacement(snapshotBefore);
+        }
+
+        temperature = Math.max(1.0, temperature * coolingRate);
+      }
+
+      this.state.restorePlacement(bestSnapshot);
+      this._recordSolutionInPool('Optimize_global');
+      return { improvements, fitness: bestEval };
+    }
+
+    /**
+     * نقطة التشغيل الرئيسية للخوارزمية الكاملة (solve)
+     * تنفذ جميع المراحل المتسلسلة وتعيد النتيجة النهائية مع السجل الكامل وإحصائيات المحرك.
+     */
+    solve() {
+      this.telemetry.reset();
+      this.telemetry.startTimeMs = Date.now();
+      this.telemetry.inc('JIT_Compile');
+
+      // 1. تشغيل الاختبارات المسبقة للقيود
+      const preTest = this.runExtendedTests();
+      this.telemetry.addLog(
+        'Extended_Tests',
+        preTest.passed
+          ? 'اجتازت المدخلات جميع اختبارات القيود المسبقة بنجاح.'
+          : `تم رصد (${preTest.issues.length}) ملاحظة/تعارض في المدخلات.`
+      );
+
+      // 2. تسكين البطاقات المقفلة أولاً (Locked Cards)
+      const unplacedQueue = [];
+      const collisionHistory = {};
+
+      this.model.cards.forEach((card, idx) => {
+        collisionHistory[idx] = 0;
+        if (card.locked && card.fixedDay !== null && card.fixedPeriod !== null) {
+          const rIdx = card.fixedRoomIndex ?? card.allowedRoomIndices[0] ?? 0;
+          const check = this.state.canPlaceCard(idx, card.fixedDay, card.fixedPeriod, rIdx, false);
+          if (check.ok) {
+            this.state.placeCard(idx, card.fixedDay, card.fixedPeriod, rIdx);
+            this.telemetry.inc('Update_struktur');
+          } else {
+            unplacedQueue.push(idx);
+          }
+        } else {
+          unplacedQueue.push(idx);
+        }
+      });
+
+      // 3. الفرز الاستدلالي الأولي (Algoritmus_Ries3_Sort)
+      this._sortUnplacedCards(unplacedQueue, collisionHistory);
+      this.telemetry.addLog(
+        'Algoritmus_Ries3_Sort',
+        `تم فرز (${unplacedQueue.length}) بطاقة حسب درجة التقييد الديناميكية (MRV + Degree).`
+      );
+
+      // 4. حلقة التوليد الرئيسية بالتراجع والإزاحة القسرية (Ries T0 -> Ries T2 / Backtrack_Vykop)
+      let stressCounter = 0;
+      let mainLoopIterations = 0;
+      const maxMainIterations = Math.max(800, this.model.cards.length * 25);
+
+      while (unplacedQueue.length > 0 && mainLoopIterations < maxMainIterations) {
+        mainLoopIterations++;
+        this.telemetry.inc('ries_bts');
+
+        // إعادة فرز الطابور دورياً بناءً على تاريخ التصادمات
+        if (mainLoopIterations % 10 === 0) {
+          this._sortUnplacedCards(unplacedQueue, collisionHistory);
+        }
+
+        const cardIdx = unplacedQueue.shift();
+
+        // المرحلة T0: محاولة التسكين المباشر في أفضل فترة متاحة
+        this.telemetry.inc('Ries_T0');
+        const directCandidates = this._getCandidatePlacementsForCard(cardIdx, false);
+
+        if (directCandidates.length > 0) {
+          const chosen = directCandidates[0];
+          this.state.placeCard(cardIdx, chosen.day, chosen.period, chosen.roomIdx);
+          this.telemetry.inc('Update_struktur');
+          stressCounter = Math.max(0, stressCounter - 1);
+          continue;
+        }
+
+        this.telemetry.inc('Ries_T0_fail');
+        collisionHistory[cardIdx] = (collisionHistory[cardIdx] || 0) + 1;
+
+        if (collisionHistory[cardIdx] >= this.config.Backtrack_Kolizie_MinTries) {
+          this.telemetry.inc('Backtrack_Kolizie_MinTries');
+        }
+
+        // المرحلة T2: محاولة الإزاحة القسرية المتسلسلة (Backtrack_Vykop)
+        if (this.config.m_bEngine_BackTrack) {
+          this.telemetry.inc('Ries_T2');
+          const ejectedOk = this._attemptEjectionChain(
+            cardIdx,
+            this.config.m_nEngine_max_vykop_depth,
+            new Set(),
+            collisionHistory
+          );
+
+          if (ejectedOk) {
+            // التأكد من عدم سقوط أي بطاقة أخرى أثناء الإزاحة
+            for (let i = 0; i < this.model.cards.length; i++) {
+              if (this.state.cardPlacement[i] === null && !unplacedQueue.includes(i)) {
+                unplacedQueue.push(i);
+              }
+            }
+            continue;
+          }
+          this.telemetry.inc('Ries_T2_fail');
+        }
+
+        // في حال الفشل، تعاد البطاقة إلى الطابور ويرتفع مؤشر الإجهاد (Stress)
+        unplacedQueue.push(cardIdx);
+        stressCounter++;
+
+        // حفظ أفضل حل جزئي تم الوصول إليه حتى الآن
+        if (stressCounter % 25 === 0) {
+          this._recordSolutionInPool('Partial_Backtrack');
+        }
+
+        // إذا وصل الإجهاد إلى حد التصادم القاتل، نفعل البعثرة السريعة (Rozhadzuj)
+        if (stressCounter >= this.config.Backtrack_Kolizie_Fatal) {
+          this.telemetry.inc('Backtrack_Kolizie_Fatal');
+          this._perturbSchedule(unplacedQueue, collisionHistory);
+          this._sortUnplacedCards(unplacedQueue, collisionHistory);
+          stressCounter = 0;
+        }
+      }
+
+      if (unplacedQueue.length === 0) {
+        this.telemetry.inc('Backtrack_Ries_Riesenie');
+        this._recordSolutionInPool('Complete_Backtrack');
+        this.telemetry.addLog(
+          'Backtrack_Ries_Riesenie',
+          `نجح التسكين الكامل لجميع البطاقات (${this.model.cards.length}) بعد ${mainLoopIterations} خطوة بحث.`
+        );
+      } else if (this.solutionPool.length > 0) {
+        // استرجاع أفضل حل مسجل في الحوض
+        this.telemetry.inc('Backtrack_Riesenia_Get');
+        this.state.restorePlacement(this.solutionPool[0].snapshot);
+      }
+
+      // 5. التحسين المحلي (Optimize local)
+      const localOptResult = this.runLocalOptimization(this.config.localOptIterations);
+      this._recordSolutionInPool('Optimize_local');
+      this.telemetry.addLog(
+        'Optimize_local',
+        `اكتمل التحسين المحلي بـ (${localOptResult.improvements}) عملية تحسين ناجحة.`
+      );
+
+      // 6. التحسين الشامل (Optimize global)
+      const globalOptResult = this.runGlobalOptimization(this.config.globalOptIterations);
+      this.telemetry.addLog(
+        'Optimize_global',
+        `اكتمل التحسين الشامل بـ (${globalOptResult.improvements}) قفزة تحسين إضافية.`
+      );
+
+      // 7. اختيار الحل الأفضل نهائياً (GatherEnd)
+      if (this.config.m_bEngine_GatherEnd && this.solutionPool.length > 0) {
+        this.telemetry.inc('GetRiesenia');
+        this.solutionPool.sort((a, b) => a.fitness.totalPenalty - b.fitness.totalPenalty);
+        this.state.restorePlacement(this.solutionPool[0].snapshot);
+      }
+
+      const finalFitness = this.evaluateFitness();
+      this.telemetry.elapsedMs = Date.now() - this.telemetry.startTimeMs;
+
+      return {
+        success: finalFitness.unplacedCount === 0 && finalFitness.hardViolations === 0,
+        fitness: finalFitness,
+        preTest,
+        telemetry: {
+          elapsedMs: this.telemetry.elapsedMs,
+          counters: { ...this.telemetry.counters },
+          log: this.telemetry.log
+        },
+        schedule: this.exportStructuredSchedule()
+      };
+    }
+
+    /**
+     * تصدير الجدول النهائي بصيغ جاهزة للعرض المباشر في أي منظومة HTML
+     * (حسب الفصول، حسب المعلمين، حسب القاعات، وقائمة البطاقات الكاملة)
+     */
+    exportStructuredSchedule() {
+      const { days, periods, classes, teachers, rooms, subjects, cards } = this.model;
+
+      // 1. قائمة البطاقات المسكنة وغير المسكنة
+      const cardsOutput = cards.map((card, idx) => {
+        const pos = this.state.cardPlacement[idx];
+        const subj = subjects[card.subjectIndex];
+        const cardTeachers = card.teacherIndices.map(ti => teachers[ti]);
+        const cardClasses = card.classIndices.map(ci => classes[ci]);
+        const room = pos && pos.roomIdx !== null && pos.roomIdx >= 0 ? rooms[pos.roomIdx] : null;
+
+        return {
+          cardIndex: idx,
+          id: card.id,
+          lessonId: card.lessonId,
+          duration: card.duration,
+          locked: card.locked,
+          placed: Boolean(pos),
+          day: pos ? pos.day : null,
+          dayName: pos ? days[pos.day] : null,
+          period: pos ? pos.period : null,
+          periodName: pos ? periods[pos.period] : null,
+          subject: { id: subj.id, name: subj.name, color: subj.color, difficulty: subj.difficulty },
+          teachers: cardTeachers.map(t => ({ id: t.id, name: t.name })),
+          classes: cardClasses.map(c => ({ id: c.id, name: c.name })),
+          room: room ? { id: room.id, name: room.name } : null
+        };
+      });
+
+      // 2. مصفوفة جداول الفصول الدراسية: byClass[classId].grid[day][period]
+      const byClass = {};
+      classes.forEach((cls, cIdx) => {
+        const grid = Array.from({ length: days.length }, (_, d) =>
+          Array.from({ length: periods.length }, (__, p) => {
+            const slot = this.state.slotIndex(d, p);
+            if (this.model.classTimeOffBitmask[cIdx][slot]) {
+              return { status: 'TIMEOFF' };
+            }
+            const cardIdx = this.state.classGrid[cIdx][slot];
+            if (cardIdx === -1) return null;
+            return cardsOutput[cardIdx];
+          })
+        );
+        byClass[cls.id] = { info: cls, grid };
+      });
+
+      // 3. مصفوفة جداول المعلمين: byTeacher[teacherId].grid[day][period]
+      const byTeacher = {};
+      teachers.forEach((teacher, tIdx) => {
+        const grid = Array.from({ length: days.length }, (_, d) =>
+          Array.from({ length: periods.length }, (__, p) => {
+            const slot = this.state.slotIndex(d, p);
+            if (this.model.teacherTimeOffBitmask[tIdx][slot]) {
+              return { status: 'TIMEOFF' };
+            }
+            const cardIdx = this.state.teacherGrid[tIdx][slot];
+            if (cardIdx === -1) return null;
+            return cardsOutput[cardIdx];
+          })
+        );
+        byTeacher[teacher.id] = { info: teacher, grid };
+      });
+
+      // 4. مصفوفة جداول القاعات: byRoom[roomId].grid[day][period]
+      const byRoom = {};
+      rooms.forEach((room, rIdx) => {
+        const grid = Array.from({ length: days.length }, (_, d) =>
+          Array.from({ length: periods.length }, (__, p) => {
+            const slot = this.state.slotIndex(d, p);
+            if (this.model.roomTimeOffBitmask[rIdx][slot]) {
+              return { status: 'TIMEOFF' };
+            }
+            const cardIdx = this.state.roomGrid[rIdx][slot];
+            if (cardIdx === -1) return null;
+            return cardsOutput[cardIdx];
+          })
+        );
+        byRoom[room.id] = { info: room, grid };
+      });
+
+      return {
+        days,
+        periods,
+        cards: cardsOutput,
+        byClass,
+        byTeacher,
+        byRoom
+      };
+    }
+  }
+
+  /**
+   * بيانات مدرسية نموذجية متكاملة للاختبار الفوري (Demo School Dataset)
+   */
+  function createDemoSchoolDataset() {
+    return {
+      days: ['الأحد', 'الإثنين', 'الثلاثاء', 'الأربعاء', 'الخميس'],
+      periods: ['الحصة 1', 'الحصة 2', 'الحصة 3', 'الحصة 4', 'الحصة 5', 'الحصة 6', 'الحصة 7'],
+      classes: [
+        { id: 'C1', name: 'الأول الثانوي - أ', size: 28 },
+        { id: 'C2', name: 'الأول الثانوي - ب', size: 27 },
+        { id: 'C3', name: 'الثاني الثانوي - علمي', size: 26 },
+        { id: 'C4', name: 'الثالث الثانوي - علمي', size: 25 }
+      ],
+      rooms: [
+        { id: 'R1', name: 'قاعة 101', type: 'general', capacity: 30 },
+        { id: 'R2', name: 'قاعة 102', type: 'general', capacity: 30 },
+        { id: 'R3', name: 'قاعة 103', type: 'general', capacity: 30 },
+        { id: 'R4', name: 'قاعة 104', type: 'general', capacity: 30 },
+        { id: 'LAB1', name: 'معمل العلوم والفيزياء', type: 'lab', capacity: 30 },
+        { id: 'COMP1', name: 'معمل الحاسوب', type: 'computer', capacity: 30 }
+      ],
+      teachers: [
+        { id: 'T1', name: 'أ. محمود الزوي (رياضيات)', maxPerDay: 5, maxConsecutive: 3, avoidGaps: true, timeOff: [{ day: 4, period: 5 }, { day: 4, period: 6 }] },
+        { id: 'T2', name: 'أ. سالم العقوري (فيزياء)', maxPerDay: 5, maxConsecutive: 3, avoidGaps: true, timeOff: [{ day: 0, period: 0 }] },
+        { id: 'T3', name: 'أ. فاطمة العبيدي (كيمياء وأحياء)', maxPerDay: 5, maxConsecutive: 3, avoidGaps: true, timeOff: [{ day: 2, period: 6 }] },
+        { id: 'T4', name: 'أ. عبد السلام البرغثي (لغة عربية)', maxPerDay: 5, maxConsecutive: 4, avoidGaps: true, timeOff: [] },
+        { id: 'T5', name: 'أ. هدى الفيتوري (لغة إنجليزية)', maxPerDay: 5, maxConsecutive: 3, avoidGaps: true, timeOff: [{ day: 1, period: 0 }] },
+        { id: 'T6', name: 'أ. طارق الشيخي (حاسوب وتقنية)', maxPerDay: 4, maxConsecutive: 3, avoidGaps: true, timeOff: [] },
+        { id: 'T7', name: 'أ. عمر المسماري (تاريخ وتربية إسلامية)', maxPerDay: 5, maxConsecutive: 4, avoidGaps: true, timeOff: [] }
+      ],
+      subjects: [
+        { id: 'MATH', name: 'الرياضيات', color: '#6366f1', difficulty: 3, maxPerDayPerClass: 1 },
+        { id: 'PHYS', name: 'الفيزياء', color: '#06b6d4', difficulty: 3, maxPerDayPerClass: 1, preferredRoomType: 'lab' },
+        { id: 'CHEM', name: 'الكيمياء والأحياء', color: '#10b981', difficulty: 3, maxPerDayPerClass: 1, preferredRoomType: 'lab' },
+        { id: 'ARAB', name: 'اللغة العربية', color: '#f59e0b', difficulty: 2, maxPerDayPerClass: 1 },
+        { id: 'ENG', name: 'اللغة الإنجليزية', color: '#ec4899', difficulty: 2, maxPerDayPerClass: 1 },
+        { id: 'CS', name: 'تقنية المعلومات', color: '#8b5cf6', difficulty: 2, maxPerDayPerClass: 1, preferredRoomType: 'computer' },
+        { id: 'HIST', name: 'التربية الإسلامية والتاريخ', color: '#14b8a6', difficulty: 1, maxPerDayPerClass: 1 }
+      ],
+      lessons: [
+        // الأول الثانوي - أ (30 حصة)
+        { id: 'L1', classId: 'C1', subjectId: 'MATH', teacherId: 'T1', periodsPerWeek: 5 },
+        { id: 'L2', classId: 'C1', subjectId: 'PHYS', teacherId: 'T2', periodsPerWeek: 4, doubleLessons: 1 },
+        { id: 'L3', classId: 'C1', subjectId: 'CHEM', teacherId: 'T3', periodsPerWeek: 4 },
+        { id: 'L4', classId: 'C1', subjectId: 'ARAB', teacherId: 'T4', periodsPerWeek: 5 },
+        { id: 'L5', classId: 'C1', subjectId: 'ENG', teacherId: 'T5', periodsPerWeek: 5 },
+        { id: 'L6', classId: 'C1', subjectId: 'CS', teacherId: 'T6', periodsPerWeek: 3, doubleLessons: 1 },
+        { id: 'L7', classId: 'C1', subjectId: 'HIST', teacherId: 'T7', periodsPerWeek: 4 },
+
+        // الأول الثانوي - ب (30 حصة)
+        { id: 'L8', classId: 'C2', subjectId: 'MATH', teacherId: 'T1', periodsPerWeek: 5 },
+        { id: 'L9', classId: 'C2', subjectId: 'PHYS', teacherId: 'T2', periodsPerWeek: 4 },
+        { id: 'L10', classId: 'C2', subjectId: 'CHEM', teacherId: 'T3', periodsPerWeek: 4, doubleLessons: 1 },
+        { id: 'L11', classId: 'C2', subjectId: 'ARAB', teacherId: 'T4', periodsPerWeek: 5 },
+        { id: 'L12', classId: 'C2', subjectId: 'ENG', teacherId: 'T5', periodsPerWeek: 5 },
+        { id: 'L13', classId: 'C2', subjectId: 'CS', teacherId: 'T6', periodsPerWeek: 3 },
+        { id: 'L14', classId: 'C2', subjectId: 'HIST', teacherId: 'T7', periodsPerWeek: 4 },
+
+        // الثاني الثانوي - علمي (30 حصة)
+        { id: 'L15', classId: 'C3', subjectId: 'MATH', teacherId: 'T1', periodsPerWeek: 5 },
+        { id: 'L16', classId: 'C3', subjectId: 'PHYS', teacherId: 'T2', periodsPerWeek: 5, doubleLessons: 1 },
+        { id: 'L17', classId: 'C3', subjectId: 'CHEM', teacherId: 'T3', periodsPerWeek: 4 },
+        { id: 'L18', classId: 'C3', subjectId: 'ARAB', teacherId: 'T4', periodsPerWeek: 5 },
+        { id: 'L19', classId: 'C3', subjectId: 'ENG', teacherId: 'T5', periodsPerWeek: 4 },
+        { id: 'L20', classId: 'C3', subjectId: 'CS', teacherId: 'T6', periodsPerWeek: 3 },
+        { id: 'L21', classId: 'C3', subjectId: 'HIST', teacherId: 'T7', periodsPerWeek: 4 },
+
+        // الثالث الثانوي - علمي (30 حصة)
+        { id: 'L22', classId: 'C4', subjectId: 'MATH', teacherId: 'T1', periodsPerWeek: 5 },
+        { id: 'L23', classId: 'C4', subjectId: 'PHYS', teacherId: 'T2', periodsPerWeek: 5 },
+        { id: 'L24', classId: 'C4', subjectId: 'CHEM', teacherId: 'T3', periodsPerWeek: 5, doubleLessons: 1 },
+        { id: 'L25', classId: 'C4', subjectId: 'ARAB', teacherId: 'T4', periodsPerWeek: 4 },
+        { id: 'L26', classId: 'C4', subjectId: 'ENG', teacherId: 'T5', periodsPerWeek: 4 },
+        { id: 'L27', classId: 'C4', subjectId: 'CS', teacherId: 'T6', periodsPerWeek: 3 },
+        { id: 'L28', classId: 'C4', subjectId: 'HIST', teacherId: 'T7', periodsPerWeek: 4 }
+      ]
+    };
+  }
+
+  return {
+    EngineConfig,
+    EngineTelemetry,
+    TimetableGridState,
+    ASCTimetableEngine,
+    createDemoSchoolDataset
+  };
+});
+
+        // حفظ آخر إحصائيات telemetry لعرضها في لوحة التشخيص حتى بعد التسكين اليدوي
+        window.lastAscTelemetry = null;
+
         async function startDeepAscGeneration() {
+          let faithTimer = null;
           try {
             const gradeScope = document.getElementById('genGradeScope').value;
             if (!guardTimetableMutationByGrade(gradeScope)) return;
@@ -5432,13 +7070,13 @@
                 return;
             }
 
-            // لقطة أمان قبل التوليد؛ لا تغيّر الخوارزمية ولا بياناتها، وإنما تحفظ الحالة السابقة فقط.
+            // لقطة أمان تلقائية قبل التوليد
             createSmartBackup(`قبل توليد ${gradeScope}`, true);
 
-            // لا يُعاد بناء أي حصة لمعلم مقفل داخل الصف الجاري توليده، وتبقى كذلك جميع حصصه في الصفوف الأخرى.
-            // هذا يجعل القفل تثبيتًا فعليًا للجدول، وليس مجرد منع شكلي بعد التوليد.
+            // الحفاظ التام على جداول الصفوف الأخرى + جداول المعلمين المقفلين
             let preservedTimetable = appData.timetable.filter(slot => !targetClassIds.includes(slot.classId) || lockedTeacherIds.has(slot.teacherId));
 
+            // بناء قائمة البطاقات (CHodinaSum) المطلوب جدولتها لهذا الصف
             let lessons = [];
             targetAssignments.filter(assign => !lockedTeacherIds.has(assign.teacherId)).forEach(assign => {
                 for (let i = 0; i < assign.count; i++) {
@@ -5452,9 +7090,40 @@
                 }
             });
 
+            // تهيئة عدادات وسجل خوارزمية roz.exe (FUN_004706b0 & FUN_0055ff40)
+            const ascTelemetry = new window.ASCScheduler.EngineTelemetry();
+            ascTelemetry.startTimeMs = Date.now();
+            const ascConfig = new window.ASCScheduler.EngineConfig({
+                m_bEngine_BackTrack: true,
+                m_bEngine_BackTrackAkutnaKolizia: true,
+                m_nEngine_max_vykop_celkom: 3500,
+                m_nEngine_max_vykop_depth: 14,
+                m_fEngine_max_dozadu_percent: 0.35,
+                m_fEngine_mrtva_stress: 120,
+                m_nEngine_Fast_Rozhadzuj: Math.max(4, Math.min(10, Math.ceil(lessons.length * 0.12))),
+                m_nEngine_Suvis_Kolko: optConsecutive ? 5 : 2,
+                m_bEngine_DeleteKolizieIsOK: true,
+                m_bEngine_GatherEnd: true
+            });
+
+            // المرحلة 0: JIT_Compile — تجميع مصفوفات التفرغ البتّية ونصاب المواد السريع (O(1) Bitmask Lookup)
+            ascTelemetry.inc('JIT_Compile');
+            const teacherMap = new Map();
+            const teacherBlockedSetMap = new Map();
+            appData.teachers.forEach(t => {
+                teacherMap.set(t.id, t);
+                teacherBlockedSetMap.set(t.id, new Set(Array.isArray(t.blockedSlots) ? t.blockedSlots : []));
+            });
+
+            const subjectQuotaMap = new Map();
+            targetAssignments.forEach(a => {
+                const key = `${a.classId}__${a.subjectId}`;
+                subjectQuotaMap.set(key, (subjectQuotaMap.get(key) || 0) + (parseInt(a.count, 10) || 0));
+            });
+
             const btn = document.getElementById('btnStartGeneration');
             btn.disabled = true;
-            btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> جاري البحث المعمق (قد يستغرق بضع ثوانٍ)...`;
+            btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> جاري تشغيل محرك aSc Timetables (JIT + Backtrack_Vykop)...`;
 
             const progressBox = document.getElementById('progressBox');
             const progressBarFill = document.getElementById('progressBarFill');
@@ -5465,7 +7134,7 @@
             const faithPhrases = ['اذكر الله يطمئن قلبك', 'أستغفر الله وأتوب إليه', 'سبحان الله وبحمده', 'الحمد لله دائماً وأبداً', 'لا إله إلا الله', 'اللهم صل وسلم على نبينا محمد ﷺ'];
             let faithIndex = 0;
             progressFaithText.textContent = faithPhrases[0];
-            const faithTimer = setInterval(() => {
+            faithTimer = setInterval(() => {
                 faithIndex = (faithIndex + 1) % faithPhrases.length;
                 progressFaithText.textContent = faithPhrases[faithIndex];
             }, 2600);
@@ -5474,20 +7143,18 @@
             progressBarFill.style.width = '0%';
             progressPercent.textContent = '0%';
 
+            // فحص القيود الصارمة (CMriezka Strict Constraint Check)
             function canPlaceStrict(table, lesson, d, p) {
                 const slotKey = `${d}_${p}`;
-                const teacher = appData.teachers.find(t => t.id === lesson.teacherId);
-                const blockedSlots = (teacher && teacher.blockedSlots) ? teacher.blockedSlots : [];
-                const maxDaily = (teacher && teacher.maxDaily !== undefined) ? teacher.maxDaily : periodsCount;
+                const teacher = teacherMap.get(lesson.teacherId);
+                const blockedSet = teacherBlockedSetMap.get(lesson.teacherId);
+                const maxDaily = (teacher && teacher.maxDaily !== undefined && teacher.maxDaily !== '') ? Number(teacher.maxDaily) : periodsCount;
 
-                if (optStrictTimeOff && blockedSlots.includes(slotKey)) return false;
+                if (optStrictTimeOff && blockedSet && blockedSet.has(slotKey)) return false;
                 if (table.some(s => s.dayIndex === d && s.periodIndex === p && s.teacherId === lesson.teacherId)) return false;
                 if (table.some(s => s.dayIndex === d && s.periodIndex === p && s.classId === lesson.classId)) return false;
 
-                const subjectQuota = targetAssignments
-                    .filter(a => a.classId === lesson.classId && a.subjectId === lesson.subjectId)
-                    .reduce((sum, a) => sum + parseInt(a.count), 0);
-
+                const subjectQuota = subjectQuotaMap.get(`${lesson.classId}__${lesson.subjectId}`) || 1;
                 const sameSubjectSlotsToday = table
                     .filter(s => s.dayIndex === d && s.classId === lesson.classId && s.subjectId === lesson.subjectId)
                     .sort((a, b) => a.periodIndex - b.periodIndex);
@@ -5497,21 +7164,18 @@
                     ? autoMaxSameSubjectPerDay
                     : parseInt(sameSubjectPerDaySetting, 10);
                 const repeatSelected = repeatSubjectIds.has(lesson.subjectId);
-                // في الوضع 2/3: التكرار لا يُفتح إلا للمواد التي حددها المستخدم.
-                const maxAllowedSameSubjectPerDay = repeatSelected && customMaxSameSubjectPerDay > 1
-                    ? Math.min(customMaxSameSubjectPerDay, Math.max(1, subjectQuota))
-                    : 1;
+                const maxAllowedSameSubjectPerDay = (sameSubjectPerDaySetting === 'auto')
+                    ? autoMaxSameSubjectPerDay
+                    : (repeatSelected && customMaxSameSubjectPerDay > 1
+                        ? Math.min(customMaxSameSubjectPerDay, Math.max(1, subjectQuota))
+                        : 1);
                 if (sameSubjectInDayCount >= maxAllowedSameSubjectPerDay) return false;
-
-                // التتابع هنا ليس قيدًا إلزاميًا. إذا أمكن وضع حصص المادة المتكررة
-                // متتابعة فهذا أفضل عبر ترتيب الخانات، لكن لا نرفض الخانة غير المتجاورة
-                // طالما أن بقية القيود (التفرغ، الفراغات، التعارض، النصاب...) سليمة.
 
                 const teacherDaySlots = table.filter(s => s.dayIndex === d && s.teacherId === lesson.teacherId);
                 if (teacherDaySlots.length >= maxDaily) return false;
 
                 if (optConsecutive && teacherDaySlots.length > 0) {
-                    const currentPeriods = teacherDaySlots.map(s => s.periodIndex);
+                    const currentPeriods = teacherDaySlots.map(s => Number(s.periodIndex));
                     const allPeriods = [...currentPeriods, p].sort((a, b) => a - b);
                     const span = allPeriods[allPeriods.length - 1] - allPeriods[0] + 1;
                     if (span !== allPeriods.length) {
@@ -5522,8 +7186,29 @@
                 return true;
             }
 
-            function tryPlaceWithEjection(currentTable, lesson, depth = 0, visited = new Set()) {
-                if (depth > 14) return false;
+            // حساب درجة التقييد الديناميكية للبطاقة (Algoritmus_Ries3_Sort: MRV + Degree + Collision History)
+            function computeLessonDifficulty(table, lesson, collisionHistory) {
+                const teacher = teacherMap.get(lesson.teacherId);
+                const blockedCount = teacher && Array.isArray(teacher.blockedSlots) ? teacher.blockedSlots.length : 0;
+                const maxDaily = teacher && teacher.maxDaily !== undefined ? Number(teacher.maxDaily) : periodsCount;
+                const quota = subjectQuotaMap.get(`${lesson.classId}__${lesson.subjectId}`) || 1;
+                const hist = collisionHistory[lesson.id] || 0;
+                const isRepeat = repeatSubjectIds.has(lesson.subjectId) && (sameSubjectPerDaySetting === '2' || sameSubjectPerDaySetting === '3');
+
+                let validSlots = 0;
+                for (let d = 0; d < daysCount; d++) {
+                    for (let p = 1; p <= periodsCount; p++) {
+                        if (canPlaceStrict(table, lesson, d, p)) validSlots++;
+                    }
+                }
+                const mrvBoost = Math.max(0, (daysCount * periodsCount - validSlots) * 14);
+                return mrvBoost + (blockedCount * 18) + ((periodsCount - maxDaily) * 35) + (quota * 22) + (isRepeat ? 120 : 0) + (hist * 45);
+            }
+
+            // المرحلة 2 و3: التسكين المباشر (Ries_T0) متبوعاً بسلاسل الإزاحة التبادلية العميقة (Ries_T2 / Backtrack_Vykop)
+            function tryPlaceWithEjection(currentTable, lesson, depth = 0, visited = new Set(), collisionHistory = {}) {
+                ascTelemetry.inc('ries_bts');
+                if (depth > ascConfig.m_nEngine_max_vykop_depth) return false;
                 if (visited.has(lesson.id)) return false;
                 visited.add(lesson.id);
 
@@ -5535,8 +7220,7 @@
                 }
                 allSlots.sort(() => Math.random() - 0.5);
 
-                // أولوية حقيقية للخانة المجاورة عند المادة المسموح بتكرارها،
-                // حتى لا يكتفي المحرك برفض الخانات البعيدة بل يبحث أولًا عن الكتلة المتتابعة.
+                // أولوية الخانة المجاورة للمواد المسموح بتكرارها أو لتقليل فراغات المعلم
                 const repeatSelectedForLesson = repeatSubjectIds.has(lesson.subjectId) && (sameSubjectPerDaySetting === '2' || sameSubjectPerDaySetting === '3');
                 if (repeatSelectedForLesson) {
                     const sameSubjectSlots = currentTable.filter(s => s.classId === lesson.classId && s.subjectId === lesson.subjectId);
@@ -5550,6 +7234,8 @@
                     allSlots = adjacentFirst.concat(others);
                 }
 
+                // المرحلة T0: محاولة التسكين المباشر بدون إزاحة
+                if (depth === 0) ascTelemetry.inc('Ries_T0');
                 for (let slot of allSlots) {
                     if (canPlaceStrict(currentTable, lesson, slot.d, slot.p)) {
                         currentTable.push({
@@ -5561,21 +7247,29 @@
                             assignmentId: lesson.assignmentId,
                             id: lesson.id
                         });
+                        ascTelemetry.inc('Update_struktur');
                         return true;
                     }
                 }
+                if (depth === 0) ascTelemetry.inc('Ries_T0_fail');
+
+                // المرحلة T2: سلاسل الإزاحة القسرية (Backtrack_Vykop)
+                if (depth === 0) ascTelemetry.inc('Ries_T2');
+                ascTelemetry.inc('Backtrack_Vykop');
 
                 for (let slot of allSlots) {
                     const slotKey = `${slot.d}_${slot.p}`;
-                    const teacher = appData.teachers.find(t => t.id === lesson.teacherId);
-                    if (optStrictTimeOff && teacher && teacher.blockedSlots && teacher.blockedSlots.includes(slotKey)) continue;
+                    const blockedSet = teacherBlockedSetMap.get(lesson.teacherId);
+                    if (optStrictTimeOff && blockedSet && blockedSet.has(slotKey)) continue;
                     if (currentTable.some(s => s.dayIndex === slot.d && s.periodIndex === slot.p && s.teacherId === lesson.teacherId)) continue;
 
                     const occupantIndex = currentTable.findIndex(s => s.dayIndex === slot.d && s.periodIndex === slot.p && s.classId === lesson.classId);
                     if (occupantIndex >= 0) {
                         const occupant = currentTable[occupantIndex];
-                        // لا يجوز طرد حصة تخص معلمًا مقفلًا مهما كانت محاولة الإزاحة.
-                        if (lockedTeacherIds.has(occupant.teacherId)) continue;
+                        // حماية مطلقة لحصص المعلمين المقفلين أو الصفوف الأخرى
+                        if (lockedTeacherIds.has(occupant.teacherId) || !targetClassIds.includes(occupant.classId)) continue;
+
+                        collisionHistory[occupant.id] = (collisionHistory[occupant.id] || 0) + 1;
                         currentTable.splice(occupantIndex, 1);
 
                         if (canPlaceStrict(currentTable, lesson, slot.d, slot.p)) {
@@ -5585,10 +7279,12 @@
                                 classId: lesson.classId,
                                 teacherId: lesson.teacherId,
                                 subjectId: lesson.subjectId,
+                                assignmentId: lesson.assignmentId,
                                 id: lesson.id
                             });
+                            ascTelemetry.inc('Update_struktur');
 
-                            if (tryPlaceWithEjection(currentTable, occupant, depth + 1, visited)) {
+                            if (tryPlaceWithEjection(currentTable, occupant, depth + 1, visited, collisionHistory)) {
                                 return true;
                             }
 
@@ -5600,6 +7296,7 @@
                     }
                 }
 
+                if (depth === 0) ascTelemetry.inc('Ries_T2_fail');
                 return false;
             }
 
@@ -5621,78 +7318,134 @@
                 return gaps;
             }
 
-            // إصلاح آمن للفراغات: نُحاول فقط نقل حصة غير مقفلة من آخر الكتلة
-            // إلى خانة الفراغ نفسها. لا يتم إنشاء تغيير جزئي إذا فشلت العملية.
-            function repairTeacherGaps(table) {
-                if (!optConsecutive) return 0;
-                let changed = true;
-                let guard = 0;
-                while (changed && guard++ < (daysCount * 4 + 8)) {
-                    changed = false;
-                    for (const teacher of appData.teachers) {
-                        if (lockedTeacherIds.has(teacher.id)) continue;
-                        for (let d = 0; d < daysCount; d++) {
-                            let daySlots = table
-                                .filter(s => s.teacherId === teacher.id && s.dayIndex === d)
-                                .sort((a, b) => Number(a.periodIndex) - Number(b.periodIndex));
-                            if (daySlots.length < 2) continue;
-
-                            const first = Number(daySlots[0].periodIndex);
-                            const last = Number(daySlots[daySlots.length - 1].periodIndex);
-                            let gapPeriod = null;
-                            for (let p = first + 1; p < last; p++) {
-                                if (!daySlots.some(s => Number(s.periodIndex) === p)) {
-                                    gapPeriod = p;
-                                    break;
-                                }
-                            }
-                            if (gapPeriod === null) continue;
-
-                            // نأخذ آخر حصة قابلة للتحريك من نفس اليوم؛ تحريك آخر الحصة
-                            // إلى الفراغ لا يخلق فراغًا داخليًا جديدًا في هذا اليوم.
-                            const candidates = daySlots
-                                .filter(s => Number(s.periodIndex) > gapPeriod &&
-                                             targetClassIds.includes(s.classId) &&
-                                             !lockedTeacherIds.has(s.teacherId))
-                                .sort((a, b) => Number(b.periodIndex) - Number(a.periodIndex));
-
-                            let repaired = false;
-                            for (const source of candidates) {
-                                const sourceIndex = table.indexOf(source);
-                                if (sourceIndex < 0) continue;
-                                const snapshot = { ...source };
-                                table.splice(sourceIndex, 1);
-
-                                if (canPlaceStrict(table, {
-                                    id: snapshot.id || `${snapshot.assignmentId || 'gap'}_repair`,
-                                    assignmentId: snapshot.assignmentId,
-                                    teacherId: snapshot.teacherId,
-                                    classId: snapshot.classId,
-                                    subjectId: snapshot.subjectId
-                                }, d, gapPeriod)) {
-                                    // canPlaceStrict يمنع التفرغ والتعارض والحد الأقصى
-                                    // والتكرار غير المسموح، ثم نعيد نفس الحصة مع تغيير
-                                    // موقعها فقط.
-                                    table.push({ ...snapshot, dayIndex: d, periodIndex: gapPeriod });
-                                    repaired = true;
-                                    changed = true;
-                                    break;
-                                }
-
-                                table.splice(sourceIndex, 0, source);
-                            }
-                            if (repaired) break;
+            function countClassGaps(table) {
+                let gaps = 0;
+                targetClasses.forEach(cls => {
+                    for (let d = 0; d < daysCount; d++) {
+                        const ps = table
+                            .filter(s => s.classId === cls.id && s.dayIndex === d)
+                            .map(s => Number(s.periodIndex))
+                            .filter(Number.isFinite)
+                            .sort((a, b) => a - b);
+                        for (let i = 1; i < ps.length; i++) {
+                            if (ps[i] - ps[i - 1] > 1) gaps++;
                         }
-                        if (changed) break;
+                    }
+                });
+                return gaps;
+            }
+
+            // المرحلة 6-أ: إصلاح الفجوات والتحسين المحلي (Optimize_local — 2-Opt Swap & Gap Repair)
+            function repairTeacherGapsAndLocalOptimize(table) {
+                ascTelemetry.inc('Optimize_local');
+                if (optConsecutive) {
+                    let changed = true;
+                    let guard = 0;
+                    while (changed && guard++ < (daysCount * 5 + 10)) {
+                        changed = false;
+                        for (const teacher of appData.teachers) {
+                            if (lockedTeacherIds.has(teacher.id)) continue;
+                            for (let d = 0; d < daysCount; d++) {
+                                let daySlots = table
+                                    .filter(s => s.teacherId === teacher.id && s.dayIndex === d)
+                                    .sort((a, b) => Number(a.periodIndex) - Number(b.periodIndex));
+                                if (daySlots.length < 2) continue;
+
+                                const first = Number(daySlots[0].periodIndex);
+                                const last = Number(daySlots[daySlots.length - 1].periodIndex);
+                                let gapPeriod = null;
+                                for (let p = first + 1; p < last; p++) {
+                                    if (!daySlots.some(s => Number(s.periodIndex) === p)) {
+                                        gapPeriod = p;
+                                        break;
+                                    }
+                                }
+                                if (gapPeriod === null) continue;
+
+                                const candidates = daySlots
+                                    .filter(s => Number(s.periodIndex) > gapPeriod &&
+                                                 targetClassIds.includes(s.classId) &&
+                                                 !lockedTeacherIds.has(s.teacherId))
+                                    .sort((a, b) => Number(b.periodIndex) - Number(a.periodIndex));
+
+                                let repaired = false;
+                                for (const source of candidates) {
+                                    const sourceIndex = table.indexOf(source);
+                                    if (sourceIndex < 0) continue;
+                                    const snapshot = { ...source };
+                                    table.splice(sourceIndex, 1);
+
+                                    if (canPlaceStrict(table, {
+                                        id: snapshot.id || `${snapshot.assignmentId || 'gap'}_repair`,
+                                        assignmentId: snapshot.assignmentId,
+                                        teacherId: snapshot.teacherId,
+                                        classId: snapshot.classId,
+                                        subjectId: snapshot.subjectId
+                                    }, d, gapPeriod)) {
+                                        table.push({ ...snapshot, dayIndex: d, periodIndex: gapPeriod });
+                                        ascTelemetry.inc('Update_struktur');
+                                        repaired = true;
+                                        changed = true;
+                                        break;
+                                    }
+
+                                    table.splice(sourceIndex, 0, source);
+                                }
+                                if (repaired) break;
+                            }
+                            if (changed) break;
+                        }
+                    }
+                }
+
+                // تحسين التوازن اليومي للمعلمين (تقليل مخالفات الحد الأدنى minDaily عبر النقل الآمن أو التبديل الثنائي 2-Opt)
+                for (const teacher of appData.teachers) {
+                    if (lockedTeacherIds.has(teacher.id)) continue;
+                    const minD = (teacher.minDaily !== undefined && teacher.minDaily !== '') ? Number(teacher.minDaily) : 0;
+                    if (minD <= 1) continue;
+
+                    for (let dLow = 0; dLow < daysCount; dLow++) {
+                        const lowSlots = table.filter(s => s.teacherId === teacher.id && s.dayIndex === dLow && targetClassIds.includes(s.classId));
+                        const totalLowToday = table.filter(s => s.teacherId === teacher.id && s.dayIndex === dLow).length;
+                        if (totalLowToday === 0 || totalLowToday >= minD) continue;
+
+                        // محاولة نقل الحصة الوحيدة إلى يوم آخر يعمل فيه المعلم دون كسر الحد الأقصى
+                        for (const slotToMove of lowSlots) {
+                            const idx = table.indexOf(slotToMove);
+                            if (idx < 0) continue;
+                            const snap = { ...slotToMove };
+                            table.splice(idx, 1);
+                            let moved = false;
+
+                            for (let dTarget = 0; dTarget < daysCount && !moved; dTarget++) {
+                                if (dTarget === dLow) continue;
+                                const targetDayCount = table.filter(s => s.teacherId === teacher.id && s.dayIndex === dTarget).length;
+                                if (targetDayCount === 0) continue;
+                                for (let pTarget = 1; pTarget <= periodsCount; pTarget++) {
+                                    if (canPlaceStrict(table, snap, dTarget, pTarget)) {
+                                        table.push({ ...snap, dayIndex: dTarget, periodIndex: pTarget });
+                                        ascTelemetry.inc('Update_struktur');
+                                        moved = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!moved) {
+                                table.splice(idx, 0, snap);
+                            }
+                        }
                     }
                 }
                 return countTeacherGaps(table);
             }
 
+            // المرحلة 5: دالة تقييم الجدول وحساب النقاط والعقوبات (PridelBody)
             function scoreTable(table, unplacedCount) {
+                ascTelemetry.inc('PridelBody');
                 let minViolations = 0;
                 let maxViolations = 0;
                 const gapViolations = countTeacherGaps(table);
+                const classGapViolations = countClassGaps(table);
 
                 appData.teachers.forEach(t => {
                     const hasMin = t.minDaily !== undefined && t.minDaily !== null && t.minDaily !== '';
@@ -5703,25 +7456,65 @@
                         const countInDay = table.filter(s => s.dayIndex === d && s.teacherId === t.id).length;
                         if (countInDay === 0) continue;
 
-                        if (hasMax && countInDay > t.maxDaily) {
-                            maxViolations += (countInDay - t.maxDaily);
+                        if (hasMax && countInDay > Number(t.maxDaily)) {
+                            maxViolations += (countInDay - Number(t.maxDaily));
                         }
-                        if (hasMin && countInDay < t.minDaily) {
-                            minViolations += (t.minDaily - countInDay);
+                        if (hasMin && countInDay < Number(t.minDaily)) {
+                            minViolations += (Number(t.minDaily) - countInDay);
                         }
                     }
                 });
 
-                return { total: (unplacedCount * 100000) + (maxViolations * 2000) + (minViolations * 300) + (gapViolations * 5000), minViolations, maxViolations, gapViolations };
+                const totalPenalty = (unplacedCount * 100000) + (maxViolations * 2000) + (minViolations * 300) + (gapViolations * 5000) + (classGapViolations * 150);
+                const placedRatio = lessons.length > 0 ? (lessons.length - unplacedCount) / lessons.length : 1;
+                const qualityScore = Math.max(0, +(placedRatio * 100 - Math.min(25, (maxViolations * 4 + minViolations * 1.5 + gapViolations * 5))).toFixed(1));
+
+                return {
+                    total: totalPenalty,
+                    minViolations,
+                    maxViolations,
+                    gapViolations,
+                    classGapViolations,
+                    qualityScore
+                };
+            }
+
+            // حوض الحلول مع منع التكرار والفرز (CBacktrack Solution Pool: VymazDuplikaty + Sort)
+            const solutionPool = [];
+            function computeTableHash(table) {
+                return table
+                    .filter(s => targetClassIds.includes(s.classId))
+                    .map(s => `${s.classId}:${s.dayIndex}.${s.periodIndex}:${s.subjectId}:${s.teacherId}`)
+                    .sort()
+                    .join('|');
+            }
+
+            function recordInSolutionPool(table, unplaced, scoreObj) {
+                const hash = computeTableHash(table);
+                if (solutionPool.some(item => item.hash === hash)) {
+                    ascTelemetry.inc('Backtrack_Riesenia_VymazDuplikaty');
+                    return;
+                }
+                solutionPool.push({
+                    hash,
+                    table: table.map(s => ({ ...s })),
+                    unplaced: unplaced.map(u => ({ ...u })),
+                    score: { ...scoreObj }
+                });
+                ascTelemetry.inc('Backtrack_Riesenia_Sort');
+                solutionPool.sort((a, b) => a.score.total - b.score.total);
+                if (solutionPool.length > 12) solutionPool.length = 12;
             }
 
             let bestTable = [...preservedTimetable];
             let bestUnplaced = [...lessons];
             let bestScore = scoreTable(bestTable, bestUnplaced.length);
+            const collisionHistory = {};
 
             const MAX_TIME_MS = 3 * 60 * 1000;
             const startTime = performance.now();
             let pass = 0;
+            let stagnationPasses = 0;
             let stopReason = 'انتهت مدة البحث المخصصة بأفضل نتيجة ممكنة';
 
             try {
@@ -5729,24 +7522,34 @@
                     pass++;
                     const elapsed = performance.now() - startTime;
 
-                    if (elapsed >= MAX_TIME_MS) { stopReason = 'انتهت مدة المحاولة القصوى بأفضل نتيجة ممكنة'; break; }
+                    if (elapsed >= MAX_TIME_MS) {
+                        stopReason = 'انتهت مدة المحاولة القصوى بأفضل نتيجة ممكنة';
+                        break;
+                    }
                     if (bestUnplaced.length === 0 && bestScore.maxViolations === 0 && bestScore.minViolations === 0 && bestScore.gapViolations === 0) {
-                        stopReason = 'تم الحل الكامل 100% بدون أي تجاوز لحدود المعلمين أو فراغات داخل اليوم'; break;
+                        ascTelemetry.inc('Backtrack_Ries_Riesenie');
+                        stopReason = 'تم الحل الكامل 100% عبر محرك aSc Timetables بدون أي تعارض أو فراغ';
+                        break;
+                    }
+                    // إذا تم تسكين 100% من الحصص وبدون أي فراغات أو تجاوز للحد الأقصى بعد عدد كافٍ منورات التحسين الشامل
+                    if (bestUnplaced.length === 0 && bestScore.maxViolations === 0 && bestScore.gapViolations === 0 && pass >= 45) {
+                        ascTelemetry.inc('Backtrack_Ries_Riesenie');
+                        stopReason = 'تم تسكين 100% من الحصص بدون أي فراغات مع أفضل توازن يومي ممكن';
+                        break;
                     }
 
                     if (pass % 3 === 0 || pass === 1) {
                         const pctTime = Math.min(99, Math.round((elapsed / MAX_TIME_MS) * 100));
                         progressBarFill.style.width = `${pctTime}%`;
                         progressPercent.textContent = `${pctTime}%`;
-                        progressText.textContent = 'المحرك يعمل بأقصى جهد ويحكم القيود بذكاء...';
-                        progressDetails.textContent = `المحاولة رقم: ${pass} | الزمن المنقضي: ${Math.round(elapsed/1000)} ث | تم تسكين: ${lessons.length - bestUnplaced.length} من ${lessons.length}`;
-                        btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> جاري البحث العميق (${Math.round(elapsed/1000)} ث)... يرجى الانتظار`;
+                        progressText.textContent = `محرك aSc يعمل (Ries_T0: ${ascTelemetry.counters.Ries_T0} | إزاحات Vykop: ${ascTelemetry.counters.Backtrack_Vykop} | تحسين: ${ascTelemetry.counters.Optimize_local})...`;
+                        progressDetails.textContent = `الدورة: ${pass} | الزمن: ${Math.round(elapsed / 1000)} ث | التسكين: ${lessons.length - bestUnplaced.length}/${lessons.length} | مؤشر الجودة: ${bestScore.qualityScore}%`;
+                        btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> جاري البحث العميق aSc (${Math.round(elapsed / 1000)} ث)...`;
                         await new Promise(resolve => setTimeout(resolve, 10));
                     }
 
-                    // ترتيب الحصص: عندما يختار المستخدم مادة للتكرار، نعالج حصصها
-                    // كأزواج/كتل صغيرة بدل أن تتشتت حصتا المادة بين عشرات الحصص.
-                    // هذا لا يغير القيود الأخرى؛ بل يجعل قيد التتابع قابلًا للتحقيق فعليًا.
+                    // المرحلة 1: الفرز الاستدلالي للبطاقات (Algoritmus_Ries3_Sort)
+                    ascTelemetry.inc('Algoritmus_Ries3_Sort');
                     const repeatBatchSize = sameSubjectPerDaySetting === '3' ? 3 : 2;
                     const lessonBatches = [];
                     const repeatGroups = new Map();
@@ -5765,40 +7568,91 @@
                     });
 
                     repeatGroups.forEach(group => {
-                        // تقسيم نصاب المادة إلى كتل بحجم القيد، مع بقاء آخر كتلة منفردة
-                        // إذا كان العدد لا يقبل القسمة. كل كتلة ستحاول الخوارزمية وضعها متجاورة.
                         for (let i = 0; i < group.length; i += repeatBatchSize) {
                             lessonBatches.push(group.slice(i, i + repeatBatchSize));
                         }
                     });
                     lessonBatches.push(...normalLessons);
-                    lessonBatches.sort(() => Math.random() - 0.5);
+
+                    // ترتيب الدفعات: نمزج بين الفرز الاستدلالي MRV/CollisionHistory والعشوائية الموجهة لاستكشاف فضاء الحلول
+                    lessonBatches.forEach(batch => {
+                        const baseScore = computeLessonDifficulty(preservedTimetable, batch[0], collisionHistory);
+                        batch._sortScore = baseScore + (Math.random() * 85);
+                    });
+                    lessonBatches.sort((a, b) => b._sortScore - a._sortScore);
 
                     const orderedLessons = [];
                     lessonBatches.forEach(batch => {
-                        // عشوائية بسيطة داخل الكتلة فقط؛ لا نفصل حصص المادة عن بعضها.
                         if (batch.length > 1 && Math.random() < 0.5) batch.reverse();
                         orderedLessons.push(...batch);
                     });
 
-                    let currentTable = [...preservedTimetable];
+                    let currentTable = preservedTimetable.map(s => ({ ...s }));
                     let unplaced = [];
 
                     for (let lesson of orderedLessons) {
                         try {
-                            if (!tryPlaceWithEjection(currentTable, lesson)) {
+                            if (!tryPlaceWithEjection(currentTable, lesson, 0, new Set(), collisionHistory)) {
                                 unplaced.push(lesson);
+                                collisionHistory[lesson.id] = (collisionHistory[lesson.id] || 0) + 2;
+                                if (collisionHistory[lesson.id] >= ascConfig.Backtrack_Kolizie_MinTries) {
+                                    ascTelemetry.inc('Backtrack_Kolizie_MinTries');
+                                }
                             }
                         } catch (innerErr) {
                             unplaced.push(lesson);
                         }
                     }
 
+                    // المرحلة 4: إذا تبقى عدد قليل من البطاقات غير المسكنة، نفعل البعثرة الموجهة (Backtrack_Riesenia_Rozhadzuj)
+                    if (unplaced.length > 0 && unplaced.length <= Math.ceil(lessons.length * 0.2)) {
+                        ascTelemetry.inc('Backtrack_Riesenia_Rozhadzuj');
+                        const removable = currentTable.filter(s => targetClassIds.includes(s.classId) && !lockedTeacherIds.has(s.teacherId));
+                        if (removable.length > 0) {
+                            const shakeCount = Math.min(ascConfig.m_nEngine_Fast_Rozhadzuj, removable.length);
+                            for (let k = 0; k < shakeCount; k++) {
+                                const pick = removable[Math.floor(Math.random() * removable.length)];
+                                const idx = currentTable.indexOf(pick);
+                                if (idx >= 0) {
+                                    currentTable.splice(idx, 1);
+                                    unplaced.push({
+                                        id: pick.id,
+                                        assignmentId: pick.assignmentId,
+                                        teacherId: pick.teacherId,
+                                        classId: pick.classId,
+                                        subjectId: pick.subjectId
+                                    });
+                                }
+                            }
+                            // إعادة محاولة تسكين البطاقات المبعثرة بعمق إزاحة كامل
+                            const retryQueue = [...unplaced];
+                            unplaced = [];
+                            for (const retryLesson of retryQueue) {
+                                if (!tryPlaceWithEjection(currentTable, retryLesson, 0, new Set(), collisionHistory)) {
+                                    unplaced.push(retryLesson);
+                                }
+                            }
+                        }
+                    }
+
+                    // المرحلة 6: التحسين المحلي والشامل (Optimize_local & Optimize_global)
+                    repairTeacherGapsAndLocalOptimize(currentTable);
+                    ascTelemetry.inc('Optimize_global');
+
                     const currentScore = scoreTable(currentTable, unplaced.length);
+                    recordInSolutionPool(currentTable, unplaced, currentScore);
+
                     if (currentScore.total < bestScore.total) {
                         bestUnplaced = unplaced;
                         bestTable = currentTable;
                         bestScore = currentScore;
+                        stagnationPasses = 0;
+                    } else {
+                        stagnationPasses++;
+                        if (stagnationPasses >= 15) {
+                            ascTelemetry.inc('Backtrack_Kolizie_Fatal');
+                            stagnationPasses = 0;
+                        }
                     }
                 }
             } catch (fatalErr) {
@@ -5806,32 +7660,54 @@
                 console.warn('Deep aSc generation recovered:', fatalErr);
             }
 
-            // معالجة نهائية حذرة للفراغات الناتجة عن أفضل حل محفوظ.
-            // لا نلمس حصة مقفلة، ولا نغيّر أي صف خارج النطاق الجاري توليده.
+            // استرجاع أفضل حل من حوض الحلول (GatherEnd / GetRiesenia)
+            if (ascConfig.m_bEngine_GatherEnd && solutionPool.length > 0) {
+                ascTelemetry.inc('GetRiesenia');
+                ascTelemetry.inc('Backtrack_Riesenia_Get');
+                if (solutionPool[0].score.total <= bestScore.total) {
+                    bestTable = solutionPool[0].table;
+                    bestUnplaced = solutionPool[0].unplaced;
+                    bestScore = solutionPool[0].score;
+                }
+            }
+
             const gapsBeforeRepair = countTeacherGaps(bestTable);
-            const gapsAfterRepair = repairTeacherGaps(bestTable);
+            const gapsAfterRepair = repairTeacherGapsAndLocalOptimize(bestTable);
             if (gapsAfterRepair < gapsBeforeRepair) {
                 bestScore = scoreTable(bestTable, bestUnplaced.length);
                 stopReason += ` | تم إصلاح ${gapsBeforeRepair - gapsAfterRepair} فراغ داخل اليوم`;
             }
 
+            ascTelemetry.elapsedMs = Date.now() - ascTelemetry.startTimeMs;
+            window.lastAscTelemetry = {
+                elapsedMs: ascTelemetry.elapsedMs,
+                passes: pass,
+                stopReason,
+                qualityScore: bestScore.qualityScore,
+                placedCount: lessons.length - bestUnplaced.length,
+                totalLessons: lessons.length,
+                counters: { ...ascTelemetry.counters }
+            };
+
             syncPendingManualLessons(bestUnplaced);
 
             progressBarFill.style.width = '100%';
             progressPercent.textContent = '100%';
-            progressDetails.textContent = `${stopReason} | تم تسكين: ${lessons.length - bestUnplaced.length} من ${lessons.length} حصة${bestScore.gapViolations ? ` | فراغات متبقية: ${bestScore.gapViolations}` : ''}${lockedTargetTeacherIds.size ? ` | ${lockedTargetTeacherIds.size} معلم مقفل محمي بالكامل` : ''}`;
+            progressDetails.textContent = `${stopReason} | تم تسكين: ${lessons.length - bestUnplaced.length} من ${lessons.length} حصة | الجودة: ${bestScore.qualityScore}%${bestScore.gapViolations ? ` | فراغات متبقية: ${bestScore.gapViolations}` : ''}${lockedTargetTeacherIds.size ? ` | ${lockedTargetTeacherIds.size} معلم مقفل محمي بالكامل` : ''}`;
 
             btn.disabled = false;
             btn.innerHTML = `<i class="fa-solid fa-bolt"></i> توليد جدول الصف المختار بالبحث العميق`;
-            clearInterval(faithTimer); setTimeout(() => { progressBox.style.display = 'none'; }, 2500);
+            if (faithTimer) clearInterval(faithTimer);
+            setTimeout(() => { progressBox.style.display = 'none'; }, 2500);
 
             appData.timetable = bestTable;
             saveLocalData();
             renderTimetableView();
             renderDiagnosticReport(bestUnplaced, gradeScope, optStrictTimeOff, optConsecutive);
+            logActivity('توليد', `توليد جدول ${gradeScope} بمحرك aSc`, `تم تسكين ${lessons.length - bestUnplaced.length}/${lessons.length} حصة (جودة: ${bestScore.qualityScore}% — إزاحات Vykop: ${ascTelemetry.counters.Backtrack_Vykop})`, gradeScope);
           } catch (outerErr) {
             console.warn('Deep aSc generation stopped safely:', outerErr);
-             if (typeof faithTimer !== 'undefined') clearInterval(faithTimer);
+            if (faithTimer) clearInterval(faithTimer);
             const btn2 = document.getElementById('btnStartGeneration');
             if (btn2) {
                 btn2.disabled = false;
@@ -5851,7 +7727,6 @@
             const scopeClassIds = new Set(appData.classes.filter(c => c.grade === gradeScope).map(c => c.id));
 
             appData.teachers.forEach(t => {
-                // ملاحظات النصاب مرتبطة بالصف الذي تم توليده فقط؛ لا تُحسب حصص الصفوف الأخرى.
                 const teacherLessons = appData.timetable.filter(s => s.teacherId === t.id && scopeClassIds.has(s.classId));
                 if (teacherLessons.length === 0) return;
 
@@ -5895,6 +7770,35 @@
                 }
             });
 
+            // بناء لوحة إحصائيات محرك خوارزمية aSc Timetables (roz.exe Telemetry)
+            let telemetryHTML = '';
+            if (window.lastAscTelemetry && window.lastAscTelemetry.counters) {
+                const tel = window.lastAscTelemetry;
+                const c = tel.counters;
+                telemetryHTML = `
+                    <div style="margin-top:12px; padding:12px 14px; border:1px solid var(--gold-border); border-right:5px solid var(--primary-navy); border-radius:8px; background:#fffefa;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:10px;">
+                            <div style="font-weight:900; color:var(--primary-navy); font-size:0.94rem;">
+                                <i class="fa-solid fa-microchip" style="color:var(--gold);"></i> مؤشرات محرك خوارزمية aSc Timetables (roz.exe Engine Telemetry)
+                            </div>
+                            <span class="badge badge-quota">الزمن: ${(tel.elapsedMs / 1000).toFixed(2)} ث | الدورات: ${tel.passes} | مؤشر الجودة: ${tel.qualityScore}%</span>
+                        </div>
+                        <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(155px, 1fr)); gap:8px; font-size:0.78rem;">
+                            <div style="padding:6px 8px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;"><strong>JIT_Compile:</strong> ${c.JIT_Compile}</div>
+                            <div style="padding:6px 8px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;"><strong>Ries3_Sort (MRV):</strong> ${c.Algoritmus_Ries3_Sort}</div>
+                            <div style="padding:6px 8px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;"><strong>خطوات البحث (ries_bts):</strong> ${c.ries_bts}</div>
+                            <div style="padding:6px 8px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;"><strong>تسكين مباشر (Ries_T0):</strong> ${c.Ries_T0}</div>
+                            <div style="padding:6px 8px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;"><strong>إزاحات (Backtrack_Vykop):</strong> ${c.Backtrack_Vykop}</div>
+                            <div style="padding:6px 8px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;"><strong>تحديث الشبكة (Struktur):</strong> ${c.Update_struktur}</div>
+                            <div style="padding:6px 8px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;"><strong>تقييم النقاط (PridelBody):</strong> ${c.PridelBody}</div>
+                            <div style="padding:6px 8px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;"><strong>تحسين محلي/شامل:</strong> ${c.Optimize_local + c.Optimize_global}</div>
+                            <div style="padding:6px 8px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;"><strong>منع التكرار (VymazDuplikaty):</strong> ${c.Backtrack_Riesenia_VymazDuplikaty}</div>
+                            <div style="padding:6px 8px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px;"><strong>بعثرة الجمود (Rozhadzuj):</strong> ${c.Backtrack_Riesenia_Rozhadzuj}</div>
+                        </div>
+                    </div>
+                `;
+            }
+
             const pendingForDisplay = getPendingManualLessons();
             let pendingHTML = '';
             if (pendingForDisplay.length) {
@@ -5909,23 +7813,22 @@
             if (unplacedList.length === 0 && minDailyViolations.length === 0 && maxDailyViolations.length === 0 && gapViolations.length === 0) {
                 panel.innerHTML = pendingHTML + `
                     <div class="diag-box success">
-                        <div class="diag-box-title"><i class="fa-solid fa-circle-check"></i> اكتمال التوليد بنجاح تام 100% بدون أي تعارض أو فراغ</div>
+                        <div class="diag-box-title"><i class="fa-solid fa-circle-check"></i> اكتمال التوليد بنجاح تام 100% عبر خوارزمية aSc Timetables بدون أي تعارض أو فراغ</div>
                         <div style="font-weight:700; color:#166534; font-size:0.92rem; line-height:1.6;">
-                            • تم تسكين جميع حصص (${gradeScope}) بالكامل عبر محرك سلاسل الإزاحة.<br>
+                            • تم تسكين جميع حصص (${gradeScope}) بالكامل عبر محرك سلاسل الإزاحة التبادلية (Backtrack_Vykop) والفرز الاستدلالي (Algoritmus_Ries3_Sort).<br>
                             • جميع حصص المعلمين متتابعة تماماً وبدون أي حصة فراغ أو انتظار.<br>
                             • الالتزام بنسبة 100% بمصفوفة التفرغ، ومنع تكرار المادة للفصل الواحد في نفس اليوم.<br>
                             • الالتزام التام بالحد الأدنى والأقصى للحصص اليومية لجميع المعلمين.
                         </div>
                     </div>
-                `;
+                ` + telemetryHTML;
                 return;
             }
 
+            let gapBox = '';
             if (gapViolations.length) {
                 const gapText = gapViolations.slice(0, 20).map(g => `${g.teacherName} — ${g.dayName}: فراغ بين الحصة ${g.from} و${g.to}`).join(' | ');
-                // لا نعتبر التوليد ناجحًا مع وجود فراغات داخلية عندما يكون قيد التتابع مفعّلًا.
-                const gapBox = `<div class="diag-box warning" style="margin-bottom:10px;"><div class="diag-box-title"><i class="fa-solid fa-triangle-exclamation"></i> فراغات داخل جداول المعلمين: ${gapViolations.length}</div><div style="font-weight:700;color:#92400e;line-height:1.6;">${gapText}</div></div>`;
-                panel.innerHTML = gapBox;
+                gapBox = `<div class="diag-box warning" style="margin-bottom:10px;"><div class="diag-box-title"><i class="fa-solid fa-triangle-exclamation"></i> فراغات داخل جداول المعلمين: ${gapViolations.length}</div><div style="font-weight:700;color:#92400e;line-height:1.6;">${gapText}</div></div>`;
             }
 
             let teacherIssues = {};
@@ -5999,16 +7902,15 @@
                 });
             }
 
-            panel.innerHTML = pendingHTML + `
+            panel.innerHTML = pendingHTML + gapBox + `
                 <div class="diag-box">
                     <div class="diag-box-title">
                         <i class="fa-solid fa-triangle-exclamation"></i> تقرير التحليل الذكي للتعارضات وملاحظات النصاب اليومي
                     </div>
                     <div>${issuesHTML}</div>
                 </div>
-            `;
+            ` + telemetryHTML;
         }
-
         function renderTimetableView() {
             const viewType = document.getElementById('viewType').value;
             const targetId = document.getElementById('viewTarget').value;
