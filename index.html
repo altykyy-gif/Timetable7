@@ -1264,7 +1264,7 @@
                             <input type="checkbox" id="optConsecutiveLessons" checked>
                             <div>
                                 <div class="custom-toggle-text"><i class="fa-solid fa-link"></i> جعل حصص المعلم متتابعة (منع حصص الفراغ والانتظار تماماً)</div>
-                                <div class="custom-toggle-desc">تجميع حصص المعلم في اليوم ككتلة واحدة مستمرة بدون حصص فراغ بينها (قيد صارم).</div>
+                                <div class="custom-toggle-desc">تجميع حصص المعلم في اليوم ككتلة واحدة مستمرة: يُسكَّن الجدول أولاً ثم تُضغط الحصص وتُزال الفجوات بالنقل والتبديل (كما يفعل aSc الأصلي).</div>
                             </div>
                         </label>
 
@@ -7143,378 +7143,546 @@
             progressBarFill.style.width = '0%';
             progressPercent.textContent = '0%';
 
-            // فحص القيود الصارمة (CMriezka Strict Constraint Check)
-            function canPlaceStrict(table, lesson, d, p) {
-                const slotKey = `${d}_${p}`;
-                const teacher = teacherMap.get(lesson.teacherId);
-                const blockedSet = teacherBlockedSetMap.get(lesson.teacherId);
-                const maxDaily = (teacher && teacher.maxDaily !== undefined && teacher.maxDaily !== '') ? Number(teacher.maxDaily) : periodsCount;
+            // ======================================================================
+            // المحرك السريع (JIT مُحاكى): مصفوفات رقمية Int32Array/Int16Array + أقنعة بتّية
+            // كل فحص قيد أصبح O(1) بدل المرور على مصفوفة الجدول النصية (table.some / filter)
+            // ======================================================================
+            const D = daysCount, P = periodsCount, SLOTS = D * P;
+            const useMask = P <= 30;
+            // تتابع حصص المعلم: لم يعد قيداً صارماً أثناء البناء، بل تفضيل قوي + مرحلة ضغط بعد التسكين
+            const strictConsecActive = !!(optConsecutive && useMask);
 
-                if (optStrictTimeOff && blockedSet && blockedSet.has(slotKey)) return false;
-                if (table.some(s => s.dayIndex === d && s.periodIndex === p && s.teacherId === lesson.teacherId)) return false;
-                if (table.some(s => s.dayIndex === d && s.periodIndex === p && s.classId === lesson.classId)) return false;
+            const teacherIdx = new Map(), classIdx = new Map(), subjectIdx = new Map();
+            const idxOf = (map, id) => { let i = map.get(id); if (i === undefined) { i = map.size; map.set(id, i); } return i; };
+            const registerIds = o => { idxOf(teacherIdx, o.teacherId); idxOf(classIdx, o.classId); idxOf(subjectIdx, o.subjectId); };
+            appData.teachers.forEach(t => idxOf(teacherIdx, t.id));
+            appData.classes.forEach(c => idxOf(classIdx, c.id));
+            (appData.subjects || []).forEach(s => idxOf(subjectIdx, s.id));
+            preservedTimetable.forEach(registerIds);
+            lessons.forEach(registerIds);
+            targetAssignments.forEach(registerIds);
+            const nT = teacherIdx.size, nC = classIdx.size, nS = subjectIdx.size;
+            const targetClassIdxList = targetClassIds.map(id => classIdx.get(id));
+            // معلمو هذا التوليد فقط (التقييم لا يُحاسَب على معلمي الصفوف الأخرى المحفوظة)
+            const tIsTarget = new Uint8Array(nT);
+            lessons.forEach(l => { tIsTarget[teacherIdx.get(l.teacherId)] = 1; });
 
-                const subjectQuota = subjectQuotaMap.get(`${lesson.classId}__${lesson.subjectId}`) || 1;
-                const sameSubjectSlotsToday = table
-                    .filter(s => s.dayIndex === d && s.classId === lesson.classId && s.subjectId === lesson.subjectId)
-                    .sort((a, b) => a.periodIndex - b.periodIndex);
-                const sameSubjectInDayCount = sameSubjectSlotsToday.length;
-                const autoMaxSameSubjectPerDay = Math.max(1, Math.ceil(subjectQuota / daysCount));
-                const customMaxSameSubjectPerDay = sameSubjectPerDaySetting === 'auto'
-                    ? autoMaxSameSubjectPerDay
-                    : parseInt(sameSubjectPerDaySetting, 10);
-                const repeatSelected = repeatSubjectIds.has(lesson.subjectId);
-                const maxAllowedSameSubjectPerDay = (sameSubjectPerDaySetting === 'auto')
-                    ? autoMaxSameSubjectPerDay
-                    : (repeatSelected && customMaxSameSubjectPerDay > 1
-                        ? Math.min(customMaxSameSubjectPerDay, Math.max(1, subjectQuota))
-                        : 1);
-                if (sameSubjectInDayCount >= maxAllowedSameSubjectPerDay) return false;
+            // مصفوفات ثابتة لكل معلم: النصاب الأقصى/الأدنى + خانات عدم التوفر كخريطة بتّية
+            const tMaxDaily = new Int32Array(nT).fill(P);
+            const tBlocked = new Uint8Array(nT * SLOTS);
+            const tHasMax = new Uint8Array(nT), tMaxCfg = new Int32Array(nT);
+            const tHasMin = new Uint8Array(nT), tMin = new Int32Array(nT);
+            appData.teachers.forEach(t => {
+                const i = teacherIdx.get(t.id);
+                const rawMax = t.maxDaily, rawMin = t.minDaily;
+                if (rawMax !== undefined && rawMax !== null && rawMax !== '' && Number.isFinite(Number(rawMax))) {
+                    tMaxDaily[i] = Number(rawMax); tHasMax[i] = 1; tMaxCfg[i] = Number(rawMax);
+                }
+                if (rawMin !== undefined && rawMin !== null && rawMin !== '' && Number.isFinite(Number(rawMin))) {
+                    tHasMin[i] = 1; tMin[i] = Number(rawMin);
+                }
+                if (optStrictTimeOff && Array.isArray(t.blockedSlots)) {
+                    t.blockedSlots.forEach(key => {
+                        const parts = String(key).split('_').map(Number);
+                        const dd = parts[0], pp = parts[1];
+                        if (dd >= 0 && dd < D && pp >= 1 && pp <= P) tBlocked[i * SLOTS + dd * P + pp - 1] = 1;
+                    });
+                }
+            });
 
-                const teacherDaySlots = table.filter(s => s.dayIndex === d && s.teacherId === lesson.teacherId);
-                if (teacherDaySlots.length >= maxDaily) return false;
+            // الحد الأقصى لتكرار المادة في اليوم لكل (صف، مادة)
+            const maxSame = new Int32Array(nC * nS).fill(1);
+            targetAssignments.forEach(a => {
+                const quota = subjectQuotaMap.get(`${a.classId}__${a.subjectId}`) || 1;
+                const auto = Math.max(1, Math.ceil(quota / D));
+                let v;
+                if (sameSubjectPerDaySetting === 'auto') {
+                    v = auto;
+                } else {
+                    const custom = parseInt(sameSubjectPerDaySetting, 10);
+                    v = (repeatSubjectIds.has(a.subjectId) && custom > 1) ? Math.min(custom, Math.max(1, quota)) : 1;
+                }
+                maxSame[classIdx.get(a.classId) * nS + subjectIdx.get(a.subjectId)] = v;
+            });
 
-                if (optConsecutive && teacherDaySlots.length > 0) {
-                    const currentPeriods = teacherDaySlots.map(s => Number(s.periodIndex));
-                    const allPeriods = [...currentPeriods, p].sort((a, b) => a - b);
-                    const span = allPeriods[allPeriods.length - 1] - allPeriods[0] + 1;
-                    if (span !== allPeriods.length) {
-                        return false;
+            const popcnt = x => {
+                x = x - ((x >>> 1) & 0x55555555);
+                x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+                return Math.imul((x + (x >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24;
+            };
+            // عدد الفراغات داخل اليوم = عدد الكتل المتصلة - 1
+            const gapsOfMask = m => (m === 0 ? 0 : popcnt(m & ~(m << 1)) - 1);
+
+            // حالة الجدول: إشغال المعلم/الصف + عدادات يومية + أقنعة بتّية + سجل تراجع (Undo Log)
+            class GenState {
+                constructor(base) {
+                    if (base) {
+                        this.tOcc = base.tOcc.slice(); this.cOcc = base.cOcc.slice();
+                        this.tCnt = base.tCnt.slice(); this.tMask = base.tMask.slice(); this.cMask = base.cMask.slice();
+                        this.csd = base.csd.slice();
+                        this.gen = new Set(base.gen);
+                    } else {
+                        this.tOcc = new Array(nT * SLOTS).fill(null);
+                        this.cOcc = new Array(nC * SLOTS).fill(null);
+                        this.tCnt = new Int16Array(nT * D);
+                        this.tMask = new Int32Array(nT * D);
+                        this.cMask = new Int32Array(nC * D);
+                        this.csd = new Int16Array(nC * nS * D);
+                        this.gen = new Set(); // الحصص المولَّدة القابلة للإزاحة فقط
+                    }
+                    this.log = [];
+                    this.ejectLeft = 0;
+                }
+                clone() { return new GenState(this); }
+                _put(e) {
+                    const d = +e.dayIndex, p = +e.periodIndex;
+                    if (!(d >= 0 && d < D && p >= 1 && p <= P)) return;
+                    const tI = teacherIdx.get(e.teacherId), cI = classIdx.get(e.classId), sI = subjectIdx.get(e.subjectId);
+                    const s = d * P + p - 1, bit = 1 << (p - 1);
+                    if (this.tOcc[tI * SLOTS + s] === null) this.tOcc[tI * SLOTS + s] = e;
+                    if (this.cOcc[cI * SLOTS + s] === null) this.cOcc[cI * SLOTS + s] = e;
+                    this.tCnt[tI * D + d]++;
+                    this.tMask[tI * D + d] |= bit;
+                    this.cMask[cI * D + d] |= bit;
+                    this.csd[(cI * nS + sI) * D + d]++;
+                }
+                _drop(e) {
+                    const d = +e.dayIndex, p = +e.periodIndex;
+                    if (!(d >= 0 && d < D && p >= 1 && p <= P)) return;
+                    const tI = teacherIdx.get(e.teacherId), cI = classIdx.get(e.classId), sI = subjectIdx.get(e.subjectId);
+                    const s = d * P + p - 1, bit = 1 << (p - 1);
+                    if (this.tOcc[tI * SLOTS + s] === e) { this.tOcc[tI * SLOTS + s] = null; this.tMask[tI * D + d] &= ~bit; }
+                    if (this.cOcc[cI * SLOTS + s] === e) { this.cOcc[cI * SLOTS + s] = null; this.cMask[cI * D + d] &= ~bit; }
+                    this.tCnt[tI * D + d]--;
+                    this.csd[(cI * nS + sI) * D + d]--;
+                }
+                add(e, isGen) {
+                    this._put(e);
+                    if (isGen) this.gen.add(e);
+                    this.log.push(1, e, isGen ? 1 : 0);
+                }
+                remove(e) {
+                    this._drop(e);
+                    const wasGen = this.gen.delete(e);
+                    this.log.push(0, e, wasGen ? 1 : 0);
+                }
+                rollback(mark) {
+                    const log = this.log;
+                    while (log.length > mark) {
+                        const g = log.pop(), e = log.pop(), type = log.pop();
+                        if (type === 1) { this._drop(e); this.gen.delete(e); }
+                        else { this._put(e); if (g) this.gen.add(e); }
                     }
                 }
-
-                return true;
+                // فحص القيود الصارمة بزمن ثابت O(1) (CMriezka Strict Constraint Check)
+                canPlace(tI, cI, sI, d, p, strict) {
+                    const s = d * P + p - 1;
+                    if (tBlocked[tI * SLOTS + s] === 1) return false;
+                    if (this.tOcc[tI * SLOTS + s] !== null) return false;
+                    if (this.cOcc[cI * SLOTS + s] !== null) return false;
+                    if (this.csd[(cI * nS + sI) * D + d] >= maxSame[cI * nS + sI]) return false;
+                    const td = tI * D + d;
+                    const cnt = this.tCnt[td];
+                    if (cnt >= tMaxDaily[tI]) return false;
+                    if (strict && cnt > 0) {
+                        const m = this.tMask[td] | (1 << (p - 1));
+                        const low = m & -m;
+                        if (((m + low) & m) !== 0) return false; // الحصص غير متصلة
+                    }
+                    return true;
+                }
             }
 
+            const makeEntry = (lesson, d, p) => ({
+                dayIndex: d, periodIndex: p,
+                classId: lesson.classId, teacherId: lesson.teacherId, subjectId: lesson.subjectId,
+                assignmentId: lesson.assignmentId, id: lesson.id
+            });
+            const toLesson = e => ({ id: e.id, assignmentId: e.assignmentId, teacherId: e.teacherId, classId: e.classId, subjectId: e.subjectId });
+
+            // الحالة الأساسية: الحصص المحفوظة فقط (صفوف أخرى + معلمون مقفلون)
+            const baseState = new GenState();
+            preservedTimetable.forEach(e => baseState.add(e, false));
+            baseState.log.length = 0;
+
+            const stateToTable = state => preservedTimetable.map(s => ({ ...s })).concat(Array.from(state.gen));
+
             // حساب درجة التقييد الديناميكية للبطاقة (Algoritmus_Ries3_Sort: MRV + Degree + Collision History)
-            function computeLessonDifficulty(table, lesson, collisionHistory) {
+            function computeLessonDifficulty(lesson, collisionHistory) {
+                const tI = teacherIdx.get(lesson.teacherId), cI = classIdx.get(lesson.classId), sI = subjectIdx.get(lesson.subjectId);
                 const teacher = teacherMap.get(lesson.teacherId);
                 const blockedCount = teacher && Array.isArray(teacher.blockedSlots) ? teacher.blockedSlots.length : 0;
-                const maxDaily = teacher && teacher.maxDaily !== undefined ? Number(teacher.maxDaily) : periodsCount;
+                const maxDaily = tMaxDaily[tI];
                 const quota = subjectQuotaMap.get(`${lesson.classId}__${lesson.subjectId}`) || 1;
                 const hist = collisionHistory[lesson.id] || 0;
                 const isRepeat = repeatSubjectIds.has(lesson.subjectId) && (sameSubjectPerDaySetting === '2' || sameSubjectPerDaySetting === '3');
 
                 let validSlots = 0;
-                for (let d = 0; d < daysCount; d++) {
-                    for (let p = 1; p <= periodsCount; p++) {
-                        if (canPlaceStrict(table, lesson, d, p)) validSlots++;
-                    }
+                for (let q = 0; q < SLOTS; q++) {
+                    if (baseState.canPlace(tI, cI, sI, (q / P) | 0, (q % P) + 1, false)) validSlots++;
                 }
-                const mrvBoost = Math.max(0, (daysCount * periodsCount - validSlots) * 14);
-                return mrvBoost + (blockedCount * 18) + ((periodsCount - maxDaily) * 35) + (quota * 22) + (isRepeat ? 120 : 0) + (hist * 45);
+                const mrvBoost = Math.max(0, (SLOTS - validSlots) * 14);
+                return mrvBoost + (blockedCount * 18) + ((P - maxDaily) * 35) + (quota * 22) + (isRepeat ? 120 : 0) + (hist * 45);
             }
 
-            // المرحلة 2 و3: التسكين المباشر (Ries_T0) متبوعاً بسلاسل الإزاحة التبادلية العميقة (Ries_T2 / Backtrack_Vykop)
-            function tryPlaceWithEjection(currentTable, lesson, depth = 0, visited = new Set(), collisionHistory = {}) {
+            // ترتيب الخانات العشوائي (مع أولوية الخانات المجاورة للمواد المسموح بتكرارها)
+            const orderBufs = [];
+            const tmpBuf = new Int32Array(SLOTS);
+            const adjFlag = new Uint8Array(SLOTS);
+            function buildOrder(state, lesson, cI, depth) {
+                let buf = orderBufs[depth];
+                if (!buf) buf = orderBufs[depth] = new Int32Array(SLOTS);
+                for (let i = 0; i < SLOTS; i++) buf[i] = i;
+                for (let i = SLOTS - 1; i > 0; i--) {
+                    const j = (Math.random() * (i + 1)) | 0;
+                    const t = buf[i]; buf[i] = buf[j]; buf[j] = t;
+                }
+                const repeatSel = repeatSubjectIds.has(lesson.subjectId) && (sameSubjectPerDaySetting === '2' || sameSubjectPerDaySetting === '3');
+                if (repeatSel) {
+                    adjFlag.fill(0);
+                    let any = false;
+                    for (let q = 0; q < SLOTS; q++) {
+                        const e = state.cOcc[cI * SLOTS + q];
+                        if (e && e.subjectId === lesson.subjectId) {
+                            const p = (q % P) + 1;
+                            if (p > 1) { adjFlag[q - 1] = 1; any = true; }
+                            if (p < P) { adjFlag[q + 1] = 1; any = true; }
+                        }
+                    }
+                    if (any) {
+                        let n = 0;
+                        for (let i = 0; i < SLOTS; i++) if (adjFlag[buf[i]]) tmpBuf[n++] = buf[i];
+                        for (let i = 0; i < SLOTS; i++) if (!adjFlag[buf[i]]) tmpBuf[n++] = buf[i];
+                        buf.set(tmpBuf);
+                    }
+                }
+                return buf;
+            }
+
+            // المرحلة 2 و3: التسكين المباشر (Ries_T0) ثم سلاسل الإزاحة المزدوجة (Ries_T2 / Backtrack_Vykop)
+            // الإزاحة المزدوجة: تُزاح حصة الفصل المتعارضة + حصة المعلم المتعارضة (في صف آخر من نفس المرحلة) معاً
+            function tryPlaceWithEjection(state, lesson, depth = 0, visited = new Set(), collisionHistory = {}) {
                 ascTelemetry.inc('ries_bts');
                 if (depth > ascConfig.m_nEngine_max_vykop_depth) return false;
                 if (visited.has(lesson.id)) return false;
                 visited.add(lesson.id);
+                if (depth === 0) { state.ejectLeft = ascConfig.m_nEngine_max_vykop_celkom; state.log.length = 0; }
 
-                let allSlots = [];
-                for (let d = 0; d < daysCount; d++) {
-                    for (let p = 1; p <= periodsCount; p++) {
-                        allSlots.push({ d, p });
+                const tI = teacherIdx.get(lesson.teacherId), cI = classIdx.get(lesson.classId), sI = subjectIdx.get(lesson.subjectId);
+                const order = buildOrder(state, lesson, cI, depth);
+
+                // المرحلة T0: تسكين مباشر — نفضّل أولاً الخانات المتصلة بحصص المعلم، ثم أي خانة صالحة (الضغط لاحقاً)
+                if (depth === 0) ascTelemetry.inc('Ries_T0');
+                if (strictConsecActive) {
+                    for (let i = 0; i < SLOTS; i++) {
+                        const q = order[i], d = (q / P) | 0, p = (q % P) + 1;
+                        if (state.canPlace(tI, cI, sI, d, p, true)) {
+                            state.add(makeEntry(lesson, d, p), true);
+                            ascTelemetry.inc('Update_struktur');
+                            return true;
+                        }
                     }
                 }
-                allSlots.sort(() => Math.random() - 0.5);
-
-                // أولوية الخانة المجاورة للمواد المسموح بتكرارها أو لتقليل فراغات المعلم
-                const repeatSelectedForLesson = repeatSubjectIds.has(lesson.subjectId) && (sameSubjectPerDaySetting === '2' || sameSubjectPerDaySetting === '3');
-                if (repeatSelectedForLesson) {
-                    const sameSubjectSlots = currentTable.filter(s => s.classId === lesson.classId && s.subjectId === lesson.subjectId);
-                    const adjacentKeys = new Set();
-                    sameSubjectSlots.forEach(s => {
-                        if (s.periodIndex > 1) adjacentKeys.add(`${s.dayIndex}_${s.periodIndex - 1}`);
-                        if (s.periodIndex < periodsCount) adjacentKeys.add(`${s.dayIndex}_${s.periodIndex + 1}`);
-                    });
-                    const adjacentFirst = allSlots.filter(slot => adjacentKeys.has(`${slot.d}_${slot.p}`));
-                    const others = allSlots.filter(slot => !adjacentKeys.has(`${slot.d}_${slot.p}`));
-                    allSlots = adjacentFirst.concat(others);
-                }
-
-                // المرحلة T0: محاولة التسكين المباشر بدون إزاحة
-                if (depth === 0) ascTelemetry.inc('Ries_T0');
-                for (let slot of allSlots) {
-                    if (canPlaceStrict(currentTable, lesson, slot.d, slot.p)) {
-                        currentTable.push({
-                            dayIndex: slot.d,
-                            periodIndex: slot.p,
-                            classId: lesson.classId,
-                            teacherId: lesson.teacherId,
-                            subjectId: lesson.subjectId,
-                            assignmentId: lesson.assignmentId,
-                            id: lesson.id
-                        });
+                for (let i = 0; i < SLOTS; i++) {
+                    const q = order[i], d = (q / P) | 0, p = (q % P) + 1;
+                    if (state.canPlace(tI, cI, sI, d, p, false)) {
+                        state.add(makeEntry(lesson, d, p), true);
                         ascTelemetry.inc('Update_struktur');
                         return true;
                     }
                 }
-                if (depth === 0) ascTelemetry.inc('Ries_T0_fail');
-
-                // المرحلة T2: سلاسل الإزاحة القسرية (Backtrack_Vykop)
-                if (depth === 0) ascTelemetry.inc('Ries_T2');
+                if (depth === 0) { ascTelemetry.inc('Ries_T0_fail'); ascTelemetry.inc('Ries_T2'); }
                 ascTelemetry.inc('Backtrack_Vykop');
 
-                for (let slot of allSlots) {
-                    const slotKey = `${slot.d}_${slot.p}`;
-                    const blockedSet = teacherBlockedSetMap.get(lesson.teacherId);
-                    if (optStrictTimeOff && blockedSet && blockedSet.has(slotKey)) continue;
-                    if (currentTable.some(s => s.dayIndex === slot.d && s.periodIndex === slot.p && s.teacherId === lesson.teacherId)) continue;
+                // المرحلة T2: إزاحة الطرفين معاً (تعارض الفصل + تعارض المعلم)
+                for (let i = 0; i < SLOTS; i++) {
+                    const q = order[i], d = (q / P) | 0, p = (q % P) + 1;
+                    if (tBlocked[tI * SLOTS + q] === 1) continue;
+                    const tOccE = state.tOcc[tI * SLOTS + q];
+                    const cOccE = state.cOcc[cI * SLOTS + q];
+                    if (tOccE === null && cOccE === null) continue;
 
-                    const occupantIndex = currentTable.findIndex(s => s.dayIndex === slot.d && s.periodIndex === slot.p && s.classId === lesson.classId);
-                    if (occupantIndex >= 0) {
-                        const occupant = currentTable[occupantIndex];
-                        // حماية مطلقة لحصص المعلمين المقفلين أو الصفوف الأخرى
-                        if (lockedTeacherIds.has(occupant.teacherId) || !targetClassIds.includes(occupant.classId)) continue;
+                    const victims = [];
+                    // حماية مطلقة لحصص المعلمين المقفلين أو الصفوف الأخرى (ليست ضمن gen)
+                    if (cOccE !== null) { if (!state.gen.has(cOccE)) continue; victims.push(cOccE); }
+                    if (tOccE !== null && tOccE !== cOccE) { if (!state.gen.has(tOccE)) continue; victims.push(tOccE); }
 
-                        collisionHistory[occupant.id] = (collisionHistory[occupant.id] || 0) + 1;
-                        currentTable.splice(occupantIndex, 1);
+                    if (--state.ejectLeft < 0) break; // m_nEngine_max_vykop_celkom
+                    const mark = state.log.length;
+                    victims.forEach(v => {
+                        collisionHistory[v.id] = (collisionHistory[v.id] || 0) + 1;
+                        state.remove(v);
+                    });
 
-                        if (canPlaceStrict(currentTable, lesson, slot.d, slot.p)) {
-                            currentTable.push({
-                                dayIndex: slot.d,
-                                periodIndex: slot.p,
-                                classId: lesson.classId,
-                                teacherId: lesson.teacherId,
-                                subjectId: lesson.subjectId,
-                                assignmentId: lesson.assignmentId,
-                                id: lesson.id
-                            });
-                            ascTelemetry.inc('Update_struktur');
-
-                            if (tryPlaceWithEjection(currentTable, occupant, depth + 1, visited, collisionHistory)) {
-                                return true;
-                            }
-
-                            currentTable.pop();
-                            currentTable.splice(occupantIndex, 0, occupant);
-                        } else {
-                            currentTable.splice(occupantIndex, 0, occupant);
+                    if (state.canPlace(tI, cI, sI, d, p, false)) {
+                        state.add(makeEntry(lesson, d, p), true);
+                        ascTelemetry.inc('Update_struktur');
+                        let ok = true;
+                        for (const v of victims) {
+                            if (!tryPlaceWithEjection(state, toLesson(v), depth + 1, visited, collisionHistory)) { ok = false; break; }
                         }
+                        if (ok) return true;
                     }
+                    state.rollback(mark);
                 }
 
                 if (depth === 0) ascTelemetry.inc('Ries_T2_fail');
                 return false;
             }
 
-            function countTeacherGaps(table) {
-                if (!optConsecutive) return 0;
+            function teacherGapsOf(state) {
+                if (!strictConsecActive) return 0;
                 let gaps = 0;
-                appData.teachers.forEach(t => {
-                    for (let d = 0; d < daysCount; d++) {
-                        const ps = table
-                            .filter(s => s.teacherId === t.id && s.dayIndex === d)
-                            .map(s => Number(s.periodIndex))
-                            .filter(Number.isFinite)
-                            .sort((a, b) => a - b);
-                        for (let i = 1; i < ps.length; i++) {
-                            if (ps[i] - ps[i - 1] > 1) gaps++;
-                        }
-                    }
-                });
+                for (let tI = 0; tI < nT; tI++) {
+                    if (!tIsTarget[tI]) continue;
+                    for (let d = 0; d < D; d++) gaps += gapsOfMask(state.tMask[tI * D + d]);
+                }
+                return gaps;
+            }
+            function classGapsOf(state) {
+                if (!useMask) return 0;
+                let gaps = 0;
+                for (const cI of targetClassIdxList) for (let d = 0; d < D; d++) gaps += gapsOfMask(state.cMask[cI * D + d]);
                 return gaps;
             }
 
-            function countClassGaps(table) {
-                let gaps = 0;
-                targetClasses.forEach(cls => {
-                    for (let d = 0; d < daysCount; d++) {
-                        const ps = table
-                            .filter(s => s.classId === cls.id && s.dayIndex === d)
-                            .map(s => Number(s.periodIndex))
-                            .filter(Number.isFinite)
-                            .sort((a, b) => a - b);
-                        for (let i = 1; i < ps.length; i++) {
-                            if (ps[i] - ps[i - 1] > 1) gaps++;
-                        }
-                    }
-                });
-                return gaps;
+            // تكلفة محلية (فراغات المعلم + فراغات الصف + مخالفة الحد الأدنى) للأيام المتأثرة فقط
+            function minViolOf(state, tI, d) {
+                if (!tHasMin[tI]) return 0;
+                const c = state.tCnt[tI * D + d];
+                return (c > 0 && c < tMin[tI]) ? tMin[tI] - c : 0;
+            }
+            function localCost(state, tKeys, cKeys) {
+                let cost = 0;
+                for (let i = 0; i < tKeys.length; i++) {
+                    const k = tKeys[i];
+                    if (tKeys.indexOf(k) !== i) continue;
+                    if (strictConsecActive) cost += 5000 * gapsOfMask(state.tMask[k]);
+                    cost += 300 * minViolOf(state, (k / D) | 0, k % D);
+                }
+                for (let i = 0; i < cKeys.length; i++) {
+                    const k = cKeys[i];
+                    if (cKeys.indexOf(k) !== i) continue;
+                    cost += 150 * gapsOfMask(state.cMask[k]);
+                }
+                return cost;
             }
 
-            // المرحلة 6-أ: إصلاح الفجوات والتحسين المحلي (Optimize_local — 2-Opt Swap & Gap Repair)
-            function repairTeacherGapsAndLocalOptimize(table) {
-                ascTelemetry.inc('Optimize_local');
-                if (optConsecutive) {
-                    let changed = true;
-                    let guard = 0;
-                    while (changed && guard++ < (daysCount * 5 + 10)) {
-                        changed = false;
-                        for (const teacher of appData.teachers) {
-                            if (lockedTeacherIds.has(teacher.id)) continue;
-                            for (let d = 0; d < daysCount; d++) {
-                                let daySlots = table
-                                    .filter(s => s.teacherId === teacher.id && s.dayIndex === d)
-                                    .sort((a, b) => Number(a.periodIndex) - Number(b.periodIndex));
-                                if (daySlots.length < 2) continue;
-
-                                const first = Number(daySlots[0].periodIndex);
-                                const last = Number(daySlots[daySlots.length - 1].periodIndex);
-                                let gapPeriod = null;
-                                for (let p = first + 1; p < last; p++) {
-                                    if (!daySlots.some(s => Number(s.periodIndex) === p)) {
-                                        gapPeriod = p;
-                                        break;
-                                    }
-                                }
-                                if (gapPeriod === null) continue;
-
-                                const candidates = daySlots
-                                    .filter(s => Number(s.periodIndex) > gapPeriod &&
-                                                 targetClassIds.includes(s.classId) &&
-                                                 !lockedTeacherIds.has(s.teacherId))
-                                    .sort((a, b) => Number(b.periodIndex) - Number(a.periodIndex));
-
-                                let repaired = false;
-                                for (const source of candidates) {
-                                    const sourceIndex = table.indexOf(source);
-                                    if (sourceIndex < 0) continue;
-                                    const snapshot = { ...source };
-                                    table.splice(sourceIndex, 1);
-
-                                    if (canPlaceStrict(table, {
-                                        id: snapshot.id || `${snapshot.assignmentId || 'gap'}_repair`,
-                                        assignmentId: snapshot.assignmentId,
-                                        teacherId: snapshot.teacherId,
-                                        classId: snapshot.classId,
-                                        subjectId: snapshot.subjectId
-                                    }, d, gapPeriod)) {
-                                        table.push({ ...snapshot, dayIndex: d, periodIndex: gapPeriod });
-                                        ascTelemetry.inc('Update_struktur');
-                                        repaired = true;
-                                        changed = true;
-                                        break;
-                                    }
-
-                                    table.splice(sourceIndex, 0, source);
-                                }
-                                if (repaired) break;
+            // نقل حصة من يوم فيه فراغ إلى خانة تقلل التكلفة الكلية
+            function tryMoveToFixGap(state, tI, d) {
+                for (let p = P; p >= 1; p--) {
+                    const e = state.tOcc[tI * SLOTS + d * P + p - 1];
+                    if (!e || !state.gen.has(e)) continue;
+                    const cI = classIdx.get(e.classId), sI = subjectIdx.get(e.subjectId);
+                    const d0 = +e.dayIndex, p0 = +e.periodIndex;
+                    for (let d2 = 0; d2 < D; d2++) {
+                        for (let p2 = 1; p2 <= P; p2++) {
+                            if (d2 === d0 && p2 === p0) continue;
+                            const tk = [tI * D + d0, tI * D + d2], ck = [cI * D + d0, cI * D + d2];
+                            const before = localCost(state, tk, ck);
+                            const mark = state.log.length;
+                            state.remove(e);
+                            if (state.canPlace(tI, cI, sI, d2, p2, false)) {
+                                state.add({ ...e, dayIndex: d2, periodIndex: p2 }, true);
+                                if (localCost(state, tk, ck) < before) { ascTelemetry.inc('Update_struktur'); return true; }
                             }
-                            if (changed) break;
+                            state.rollback(mark);
                         }
                     }
                 }
+                return false;
+            }
 
-                // تحسين التوازن اليومي للمعلمين (تقليل مخالفات الحد الأدنى minDaily عبر النقل الآمن أو التبديل الثنائي 2-Opt)
-                for (const teacher of appData.teachers) {
-                    if (lockedTeacherIds.has(teacher.id)) continue;
-                    const minD = (teacher.minDaily !== undefined && teacher.minDaily !== '') ? Number(teacher.minDaily) : 0;
-                    if (minD <= 1) continue;
+            // تبديل ثنائي 2-Opt بين حصتين لنفس الصف (يحافظ على إشغال الصف) لتقليل الفراغات
+            function trySwapToFixGap(state, tI, d) {
+                for (let p = P; p >= 1; p--) {
+                    const e1 = state.tOcc[tI * SLOTS + d * P + p - 1];
+                    if (!e1 || !state.gen.has(e1)) continue;
+                    const cI = classIdx.get(e1.classId), s1 = subjectIdx.get(e1.subjectId);
+                    const d1 = +e1.dayIndex, p1 = +e1.periodIndex;
+                    for (let q = 0; q < SLOTS; q++) {
+                        const e2 = state.cOcc[cI * SLOTS + q];
+                        if (!e2 || e2 === e1 || !state.gen.has(e2)) continue;
+                        const t2 = teacherIdx.get(e2.teacherId), s2 = subjectIdx.get(e2.subjectId);
+                        const d2 = (q / P) | 0, p2 = (q % P) + 1;
+                        const tk = [tI * D + d1, tI * D + d2, t2 * D + d1, t2 * D + d2], ck = [cI * D + d1, cI * D + d2];
+                        const before = localCost(state, tk, ck);
+                        const mark = state.log.length;
+                        state.remove(e1); state.remove(e2);
+                        if (state.canPlace(tI, cI, s1, d2, p2, false)) {
+                            state.add({ ...e1, dayIndex: d2, periodIndex: p2 }, true);
+                            if (state.canPlace(t2, cI, s2, d1, p1, false)) {
+                                state.add({ ...e2, dayIndex: d1, periodIndex: p1 }, true);
+                                if (localCost(state, tk, ck) < before) { ascTelemetry.inc('Update_struktur'); return true; }
+                            }
+                        }
+                        state.rollback(mark);
+                    }
+                }
+                return false;
+            }
 
-                    for (let dLow = 0; dLow < daysCount; dLow++) {
-                        const lowSlots = table.filter(s => s.teacherId === teacher.id && s.dayIndex === dLow && targetClassIds.includes(s.classId));
-                        const totalLowToday = table.filter(s => s.teacherId === teacher.id && s.dayIndex === dLow).length;
-                        if (totalLowToday === 0 || totalLowToday >= minD) continue;
-
-                        // محاولة نقل الحصة الوحيدة إلى يوم آخر يعمل فيه المعلم دون كسر الحد الأقصى
-                        for (const slotToMove of lowSlots) {
-                            const idx = table.indexOf(slotToMove);
-                            if (idx < 0) continue;
-                            const snap = { ...slotToMove };
-                            table.splice(idx, 1);
+            // تحسين التوازن اليومي للمعلمين (تقليل مخالفات الحد الأدنى minDaily بالنقل الآمن)
+            function balanceMinDaily(state) {
+                for (let tI = 0; tI < nT; tI++) {
+                    if (!tHasMin[tI] || tMin[tI] <= 1) continue;
+                    for (let dLow = 0; dLow < D; dLow++) {
+                        const total = state.tCnt[tI * D + dLow];
+                        if (total === 0 || total >= tMin[tI]) continue;
+                        const lowEntries = [];
+                        for (let p = 1; p <= P; p++) {
+                            const e = state.tOcc[tI * SLOTS + dLow * P + p - 1];
+                            if (e && state.gen.has(e)) lowEntries.push(e);
+                        }
+                        for (const e of lowEntries) {
+                            const cI = classIdx.get(e.classId), sI = subjectIdx.get(e.subjectId);
+                            const mark = state.log.length;
+                            state.remove(e);
                             let moved = false;
-
-                            for (let dTarget = 0; dTarget < daysCount && !moved; dTarget++) {
-                                if (dTarget === dLow) continue;
-                                const targetDayCount = table.filter(s => s.teacherId === teacher.id && s.dayIndex === dTarget).length;
-                                if (targetDayCount === 0) continue;
-                                for (let pTarget = 1; pTarget <= periodsCount; pTarget++) {
-                                    if (canPlaceStrict(table, snap, dTarget, pTarget)) {
-                                        table.push({ ...snap, dayIndex: dTarget, periodIndex: pTarget });
+                            for (let dT = 0; dT < D && !moved; dT++) {
+                                if (dT === dLow || state.tCnt[tI * D + dT] === 0) continue;
+                                for (let pT = 1; pT <= P; pT++) {
+                                    if (state.canPlace(tI, cI, sI, dT, pT, strictConsecActive)) {
+                                        state.add({ ...e, dayIndex: dT, periodIndex: pT }, true);
                                         ascTelemetry.inc('Update_struktur');
                                         moved = true;
                                         break;
                                     }
                                 }
                             }
-                            if (!moved) {
-                                table.splice(idx, 0, snap);
+                            if (!moved) state.rollback(mark);
+                        }
+                    }
+                }
+            }
+
+            // المرحلة 6: مرحلة الضغط الذكية بعد التسكين (Optimize_local — Gap Compaction: نقل + تبديل 2-Opt)
+            function compactTeacherGaps(state) {
+                ascTelemetry.inc('Optimize_local');
+                if (strictConsecActive) {
+                    let improved = true, guard = 0;
+                    while (improved && guard++ < 12) {
+                        improved = false;
+                        for (let tI = 0; tI < nT; tI++) {
+                            for (let d = 0; d < D; d++) {
+                                if (gapsOfMask(state.tMask[tI * D + d]) === 0) continue;
+                                if (tryMoveToFixGap(state, tI, d) || trySwapToFixGap(state, tI, d)) improved = true;
                             }
                         }
                     }
                 }
-                return countTeacherGaps(table);
+                balanceMinDaily(state);
+            }
+
+            // المرحلة 6-ب: تحسين شامل بالتبريد المحاكى (Optimize_global — Simulated Annealing)
+            // حركات تبديل داخل الصف الواحد (تحافظ على امتلاء الصف وعلى التعارضات) مع قبول تدريجي للحلول الأسوأ ثم التبريد
+            function annealState(state, iters, T0, T1) {
+                ascTelemetry.inc('Optimize_global');
+                const cl = targetClassIdxList;
+                if (!cl.length) return;
+                const alpha = Math.pow(T1 / T0, 1 / Math.max(1, iters));
+                let T = T0;
+                for (let it = 0; it < iters; it++, T *= alpha) {
+                    const cI = cl[(Math.random() * cl.length) | 0];
+                    const q1 = (Math.random() * SLOTS) | 0, q2 = (Math.random() * SLOTS) | 0;
+                    if (q1 === q2) continue;
+                    const e1 = state.cOcc[cI * SLOTS + q1];
+                    if (!e1 || !state.gen.has(e1)) continue;
+                    const e2 = state.cOcc[cI * SLOTS + q2];
+                    if (e2 && !state.gen.has(e2)) continue; // حماية الحصص المقفلة
+                    const d1 = (q1 / P) | 0, p1 = (q1 % P) + 1, d2 = (q2 / P) | 0, p2 = (q2 % P) + 1;
+                    const t1 = teacherIdx.get(e1.teacherId), s1 = subjectIdx.get(e1.subjectId);
+                    const tk = [t1 * D + d1, t1 * D + d2], ck = [cI * D + d1, cI * D + d2];
+                    let t2 = -1, s2 = -1;
+                    if (e2) {
+                        t2 = teacherIdx.get(e2.teacherId); s2 = subjectIdx.get(e2.subjectId);
+                        tk.push(t2 * D + d1, t2 * D + d2);
+                    }
+                    const before = localCost(state, tk, ck);
+                    const mark = state.log.length;
+                    state.remove(e1);
+                    if (e2) state.remove(e2);
+                    let ok = state.canPlace(t1, cI, s1, d2, p2, false);
+                    if (ok) {
+                        state.add({ ...e1, dayIndex: d2, periodIndex: p2 }, true);
+                        if (e2) {
+                            ok = state.canPlace(t2, cI, s2, d1, p1, false);
+                            if (ok) state.add({ ...e2, dayIndex: d1, periodIndex: p1 }, true);
+                        }
+                    }
+                    if (ok) {
+                        const delta = localCost(state, tk, ck) - before;
+                        if (delta <= 0 || Math.random() < Math.exp(-delta / T)) { state.log.length = 0; continue; }
+                    }
+                    state.rollback(mark);
+                    state.log.length = 0;
+                }
             }
 
             // المرحلة 5: دالة تقييم الجدول وحساب النقاط والعقوبات (PridelBody)
-            function scoreTable(table, unplacedCount) {
+            function scoreState(state, unplacedCount) {
                 ascTelemetry.inc('PridelBody');
-                let minViolations = 0;
-                let maxViolations = 0;
-                const gapViolations = countTeacherGaps(table);
-                const classGapViolations = countClassGaps(table);
+                let minViolations = 0, maxViolations = 0;
+                const gapViolations = teacherGapsOf(state);
+                const classGapViolations = classGapsOf(state);
 
-                appData.teachers.forEach(t => {
-                    const hasMin = t.minDaily !== undefined && t.minDaily !== null && t.minDaily !== '';
-                    const hasMax = t.maxDaily !== undefined && t.maxDaily !== null && t.maxDaily !== '';
-                    if (!hasMin && !hasMax) return;
-
-                    for (let d = 0; d < daysCount; d++) {
-                        const countInDay = table.filter(s => s.dayIndex === d && s.teacherId === t.id).length;
-                        if (countInDay === 0) continue;
-
-                        if (hasMax && countInDay > Number(t.maxDaily)) {
-                            maxViolations += (countInDay - Number(t.maxDaily));
-                        }
-                        if (hasMin && countInDay < Number(t.minDaily)) {
-                            minViolations += (Number(t.minDaily) - countInDay);
-                        }
+                for (let tI = 0; tI < nT; tI++) {
+                    if (!tIsTarget[tI] || (!tHasMin[tI] && !tHasMax[tI])) continue;
+                    for (let d = 0; d < D; d++) {
+                        const c = state.tCnt[tI * D + d];
+                        if (c === 0) continue;
+                        if (tHasMax[tI] && c > tMaxCfg[tI]) maxViolations += (c - tMaxCfg[tI]);
+                        if (tHasMin[tI] && c < tMin[tI]) minViolations += (tMin[tI] - c);
                     }
-                });
+                }
 
                 const totalPenalty = (unplacedCount * 100000) + (maxViolations * 2000) + (minViolations * 300) + (gapViolations * 5000) + (classGapViolations * 150);
                 const placedRatio = lessons.length > 0 ? (lessons.length - unplacedCount) / lessons.length : 1;
                 const qualityScore = Math.max(0, +(placedRatio * 100 - Math.min(25, (maxViolations * 4 + minViolations * 1.5 + gapViolations * 5))).toFixed(1));
-
-                return {
-                    total: totalPenalty,
-                    minViolations,
-                    maxViolations,
-                    gapViolations,
-                    classGapViolations,
-                    qualityScore
-                };
+                return { total: totalPenalty, minViolations, maxViolations, gapViolations, classGapViolations, qualityScore };
             }
 
             // حوض الحلول مع منع التكرار والفرز (CBacktrack Solution Pool: VymazDuplikaty + Sort)
             const solutionPool = [];
-            function computeTableHash(table) {
-                return table
-                    .filter(s => targetClassIds.includes(s.classId))
-                    .map(s => `${s.classId}:${s.dayIndex}.${s.periodIndex}:${s.subjectId}:${s.teacherId}`)
-                    .sort()
-                    .join('|');
+            const poolHashes = new Set();
+            function hashState(state) {
+                let h1 = 0x811c9dc5, h2 = 0x1234567;
+                for (const cI of targetClassIdxList) {
+                    for (let q = 0; q < SLOTS; q++) {
+                        const e = state.cOcc[cI * SLOTS + q];
+                        const v = e ? ((teacherIdx.get(e.teacherId) + 1) * 131 + (subjectIdx.get(e.subjectId) + 1)) : 0;
+                        h1 = Math.imul(h1 ^ v, 16777619);
+                        h2 = (Math.imul(h2 + v + q, 0x85ebca6b) ^ (h2 >>> 13)) | 0;
+                    }
+                }
+                return (h1 >>> 0).toString(36) + '_' + (h2 >>> 0).toString(36);
             }
-
-            function recordInSolutionPool(table, unplaced, scoreObj) {
-                const hash = computeTableHash(table);
-                if (solutionPool.some(item => item.hash === hash)) {
+            function recordInSolutionPool(state, unplaced, scoreObj) {
+                const hash = hashState(state);
+                if (poolHashes.has(hash)) {
                     ascTelemetry.inc('Backtrack_Riesenia_VymazDuplikaty');
                     return;
                 }
-                solutionPool.push({
-                    hash,
-                    table: table.map(s => ({ ...s })),
-                    unplaced: unplaced.map(u => ({ ...u })),
-                    score: { ...scoreObj }
-                });
+                solutionPool.push({ hash, state, unplaced: unplaced.map(u => ({ ...u })), score: { ...scoreObj } });
+                poolHashes.add(hash);
                 ascTelemetry.inc('Backtrack_Riesenia_Sort');
                 solutionPool.sort((a, b) => a.score.total - b.score.total);
-                if (solutionPool.length > 12) solutionPool.length = 12;
+                while (solutionPool.length > 12) poolHashes.delete(solutionPool.pop().hash);
             }
 
-            let bestTable = [...preservedTimetable];
+            let bestState = baseState.clone();
             let bestUnplaced = [...lessons];
-            let bestScore = scoreTable(bestTable, bestUnplaced.length);
+            let bestScore = scoreState(bestState, bestUnplaced.length);
             const collisionHistory = {};
 
             const MAX_TIME_MS = 3 * 60 * 1000;
             const startTime = performance.now();
+            let lastYield = startTime;
             let pass = 0;
             let stagnationPasses = 0;
+            let saStagnation = 0;
+            const SA_STAGNATION_LIMIT = 130;
+            const SA_ITERS = 60000;
             let stopReason = 'انتهت مدة البحث المخصصة بأفضل نتيجة ممكنة';
 
             try {
@@ -7531,21 +7699,39 @@
                         stopReason = 'تم الحل الكامل 100% عبر محرك aSc Timetables بدون أي تعارض أو فراغ';
                         break;
                     }
-                    // إذا تم تسكين 100% من الحصص وبدون أي فراغات أو تجاوز للحد الأقصى بعد عدد كافٍ منورات التحسين الشامل
-                    if (bestUnplaced.length === 0 && bestScore.maxViolations === 0 && bestScore.gapViolations === 0 && pass >= 45) {
+                    // تسكين 100% ثم لا تحسّن بعد عدة جولات تبريد متتالية: نعتمد أفضل توازن يومي وصلنا إليه
+                    if (bestUnplaced.length === 0 && bestScore.maxViolations === 0 && bestScore.gapViolations === 0 && saStagnation >= SA_STAGNATION_LIMIT) {
                         ascTelemetry.inc('Backtrack_Ries_Riesenie');
-                        stopReason = 'تم تسكين 100% من الحصص بدون أي فراغات مع أفضل توازن يومي ممكن';
+                        stopReason = 'تم تسكين 100% من الحصص بدون فراغات مع أفضل توازن يومي ممكن (لا تحسن إضافي بعد جولات تبريد متتالية)';
                         break;
                     }
 
-                    if (pass % 3 === 0 || pass === 1) {
+                    // تحديث الواجهة والتنفس للمتصفح حسب الزمن (وليس كل 3 دورات) كي لا يبطّئ المحرك السريع
+                    const nowT = performance.now();
+                    if (pass === 1 || nowT - lastYield > 60) {
                         const pctTime = Math.min(99, Math.round((elapsed / MAX_TIME_MS) * 100));
                         progressBarFill.style.width = `${pctTime}%`;
                         progressPercent.textContent = `${pctTime}%`;
                         progressText.textContent = `محرك aSc يعمل (Ries_T0: ${ascTelemetry.counters.Ries_T0} | إزاحات Vykop: ${ascTelemetry.counters.Backtrack_Vykop} | تحسين: ${ascTelemetry.counters.Optimize_local})...`;
                         progressDetails.textContent = `الدورة: ${pass} | الزمن: ${Math.round(elapsed / 1000)} ث | التسكين: ${lessons.length - bestUnplaced.length}/${lessons.length} | مؤشر الجودة: ${bestScore.qualityScore}%`;
                         btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> جاري البحث العميق aSc (${Math.round(elapsed / 1000)} ث)...`;
-                        await new Promise(resolve => setTimeout(resolve, 10));
+                        await new Promise(resolve => setTimeout(resolve, 0));
+                        lastYield = performance.now();
+                    }
+
+                    // وصلنا لتسكين كامل: نحسّن الجدول الأفضل بالتبريد المحاكى بدل إعادة البناء من الصفر
+                    if (bestUnplaced.length === 0 && (bestScore.minViolations > 0 || bestScore.gapViolations > 0 || bestScore.classGapViolations > 0) && (saStagnation % 6 !== 5)) {
+                        const saCur = bestState.clone();
+                        annealState(saCur, SA_ITERS, 350, 12);
+                        compactTeacherGaps(saCur);
+                        const saScore = scoreState(saCur, 0);
+                        recordInSolutionPool(saCur, [], saScore);
+                        if (saScore.total < bestScore.total) {
+                            bestState = saCur; bestScore = saScore; saStagnation = 0;
+                        } else {
+                            saStagnation++;
+                        }
+                        continue;
                     }
 
                     // المرحلة 1: الفرز الاستدلالي للبطاقات (Algoritmus_Ries3_Sort)
@@ -7574,10 +7760,9 @@
                     });
                     lessonBatches.push(...normalLessons);
 
-                    // ترتيب الدفعات: نمزج بين الفرز الاستدلالي MRV/CollisionHistory والعشوائية الموجهة لاستكشاف فضاء الحلول
+                    // ترتيب الدفعات: مزج بين الفرز الاستدلالي MRV/CollisionHistory والعشوائية الموجهة
                     lessonBatches.forEach(batch => {
-                        const baseScore = computeLessonDifficulty(preservedTimetable, batch[0], collisionHistory);
-                        batch._sortScore = baseScore + (Math.random() * 85);
+                        batch._sortScore = computeLessonDifficulty(batch[0], collisionHistory) + (Math.random() * 85);
                     });
                     lessonBatches.sort((a, b) => b._sortScore - a._sortScore);
 
@@ -7587,12 +7772,12 @@
                         orderedLessons.push(...batch);
                     });
 
-                    let currentTable = preservedTimetable.map(s => ({ ...s }));
+                    const cur = baseState.clone();
                     let unplaced = [];
 
-                    for (let lesson of orderedLessons) {
+                    for (const lesson of orderedLessons) {
                         try {
-                            if (!tryPlaceWithEjection(currentTable, lesson, 0, new Set(), collisionHistory)) {
+                            if (!tryPlaceWithEjection(cur, lesson, 0, new Set(), collisionHistory)) {
                                 unplaced.push(lesson);
                                 collisionHistory[lesson.id] = (collisionHistory[lesson.id] || 0) + 2;
                                 if (collisionHistory[lesson.id] >= ascConfig.Backtrack_Kolizie_MinTries) {
@@ -7604,51 +7789,64 @@
                         }
                     }
 
-                    // المرحلة 4: إذا تبقى عدد قليل من البطاقات غير المسكنة، نفعل البعثرة الموجهة (Backtrack_Riesenia_Rozhadzuj)
+                    // المرحلة 4: البعثرة الموجهة (Backtrack_Riesenia_Rozhadzuj) إذا بقيت بطاقات قليلة غير مسكنة
                     if (unplaced.length > 0 && unplaced.length <= Math.ceil(lessons.length * 0.2)) {
                         ascTelemetry.inc('Backtrack_Riesenia_Rozhadzuj');
-                        const removable = currentTable.filter(s => targetClassIds.includes(s.classId) && !lockedTeacherIds.has(s.teacherId));
+                        const removable = Array.from(cur.gen);
                         if (removable.length > 0) {
                             const shakeCount = Math.min(ascConfig.m_nEngine_Fast_Rozhadzuj, removable.length);
                             for (let k = 0; k < shakeCount; k++) {
                                 const pick = removable[Math.floor(Math.random() * removable.length)];
-                                const idx = currentTable.indexOf(pick);
-                                if (idx >= 0) {
-                                    currentTable.splice(idx, 1);
-                                    unplaced.push({
-                                        id: pick.id,
-                                        assignmentId: pick.assignmentId,
-                                        teacherId: pick.teacherId,
-                                        classId: pick.classId,
-                                        subjectId: pick.subjectId
-                                    });
+                                if (cur.gen.has(pick)) {
+                                    cur.remove(pick);
+                                    unplaced.push(toLesson(pick));
                                 }
                             }
-                            // إعادة محاولة تسكين البطاقات المبعثرة بعمق إزاحة كامل
                             const retryQueue = [...unplaced];
                             unplaced = [];
                             for (const retryLesson of retryQueue) {
-                                if (!tryPlaceWithEjection(currentTable, retryLesson, 0, new Set(), collisionHistory)) {
+                                if (!tryPlaceWithEjection(cur, retryLesson, 0, new Set(), collisionHistory)) {
                                     unplaced.push(retryLesson);
                                 }
                             }
                         }
                     }
 
-                    // المرحلة 6: التحسين المحلي والشامل (Optimize_local & Optimize_global)
-                    repairTeacherGapsAndLocalOptimize(currentTable);
+                    // المرحلة 6: ضغط الحصص وإزالة الفجوات بعد التسكين (Optimize_local / Optimize_global)
+                    compactTeacherGaps(cur);
+                    if (unplaced.length > 0) {
+                        // الضغط قد يحرر خانات جديدة: نعيد محاولة تسكين المتبقي
+                        const queue = unplaced;
+                        unplaced = [];
+                        let anyPlaced = false;
+                        for (const l of queue) {
+                            if (tryPlaceWithEjection(cur, l, 0, new Set(), collisionHistory)) anyPlaced = true;
+                            else unplaced.push(l);
+                        }
+                        if (anyPlaced) compactTeacherGaps(cur);
+                    }
                     ascTelemetry.inc('Optimize_global');
+                    // بناء جديد كامل التسكين: نحسّنه بالتبريد قبل مقارنته بالأفضل (تنويع البحث)
+                    if (unplaced.length === 0) {
+                        const sc0 = scoreState(cur, 0);
+                        if (sc0.minViolations > 0 || sc0.gapViolations > 0 || sc0.classGapViolations > 0) {
+                            annealState(cur, SA_ITERS, 350, 12);
+                            compactTeacherGaps(cur);
+                        }
+                    }
 
-                    const currentScore = scoreTable(currentTable, unplaced.length);
-                    recordInSolutionPool(currentTable, unplaced, currentScore);
+                    const currentScore = scoreState(cur, unplaced.length);
+                    recordInSolutionPool(cur, unplaced, currentScore);
 
                     if (currentScore.total < bestScore.total) {
                         bestUnplaced = unplaced;
-                        bestTable = currentTable;
+                        bestState = cur;
                         bestScore = currentScore;
                         stagnationPasses = 0;
+                        saStagnation = 0;
                     } else {
                         stagnationPasses++;
+                        if (bestUnplaced.length === 0) saStagnation++;
                         if (stagnationPasses >= 15) {
                             ascTelemetry.inc('Backtrack_Kolizie_Fatal');
                             stagnationPasses = 0;
@@ -7665,18 +7863,21 @@
                 ascTelemetry.inc('GetRiesenia');
                 ascTelemetry.inc('Backtrack_Riesenia_Get');
                 if (solutionPool[0].score.total <= bestScore.total) {
-                    bestTable = solutionPool[0].table;
+                    bestState = solutionPool[0].state;
                     bestUnplaced = solutionPool[0].unplaced;
                     bestScore = solutionPool[0].score;
                 }
             }
 
-            const gapsBeforeRepair = countTeacherGaps(bestTable);
-            const gapsAfterRepair = repairTeacherGapsAndLocalOptimize(bestTable);
+            // ضغط نهائي على أفضل حل
+            const gapsBeforeRepair = teacherGapsOf(bestState);
+            compactTeacherGaps(bestState);
+            const gapsAfterRepair = teacherGapsOf(bestState);
             if (gapsAfterRepair < gapsBeforeRepair) {
-                bestScore = scoreTable(bestTable, bestUnplaced.length);
+                bestScore = scoreState(bestState, bestUnplaced.length);
                 stopReason += ` | تم إصلاح ${gapsBeforeRepair - gapsAfterRepair} فراغ داخل اليوم`;
             }
+            const bestTable = stateToTable(bestState);
 
             ascTelemetry.elapsedMs = Date.now() - ascTelemetry.startTimeMs;
             window.lastAscTelemetry = {
